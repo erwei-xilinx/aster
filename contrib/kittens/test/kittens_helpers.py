@@ -22,20 +22,6 @@ MCPU = "gfx942"
 WAVEFRONT_SIZE = 64
 
 
-@dataclass
-class KittensRunConfig:
-    """Runtime config for kernel launches.
-
-    Mutated from run_profiling.py for profiling.
-    """
-
-    num_blocks: int = 1
-    num_iterations: int = 1
-
-
-run_config = KittensRunConfig()
-
-
 def get_kittens_library_paths() -> List[str]:
     """Get paths to all required library files including kittens."""
     base_paths = get_library_paths()
@@ -61,7 +47,10 @@ def run_kittens_kernel(
     output_args=None,
     pass_pipeline=None,
     template_substitutions=None,
+    grid_dim=(1, 1, 1),
     block_dim=(64, 1, 1),
+    num_iterations=1,
+    print_ir_after_all=False,
 ):
     """Compile an MLIR file to HSACO and execute the kernel on GPU."""
     preprocess = None
@@ -73,7 +62,7 @@ def run_kittens_kernel(
                 content = content.replace(pattern, replacement)
             return content
 
-    _compile_and_run(
+    return _compile_and_run(
         file_name=mlir_file,
         kernel_name=kernel_name,
         input_data=input_args,
@@ -83,11 +72,11 @@ def run_kittens_kernel(
         library_paths=get_kittens_library_paths(),
         mcpu=MCPU,
         wavefront_size=WAVEFRONT_SIZE,
-        grid_dim=(run_config.num_blocks, 1, 1),
+        grid_dim=grid_dim,
         block_dim=block_dim,
-        num_iterations=run_config.num_iterations,
+        num_iterations=num_iterations,
         skip_on_cross_compile=True,
-        # print_ir_after_all=True,
+        print_ir_after_all=print_ir_after_all,
     )
 
 
@@ -101,8 +90,22 @@ def _make_gemm_inputs(K):
 
 PIPELINE_STAGE_CONFIGS = {
     # num_stages: (STAGE_LOAD, STAGE_SYNC, STAGE_COMPUTE)
+    # Used by 3-stage templates (test_014 through test_019).
     2: (0, 1, 1),
     3: (0, 1, 2),
+    4: (0, 2, 3),
+    5: (0, 3, 4),
+}
+
+PIPELINE_STAGE_CONFIGS_4 = {
+    # num_stages: (STAGE_GLOBAL_LOAD, STAGE_DS_WRITE, STAGE_DS_READ, STAGE_COMPUTE)
+    # 4-stage split: separates global load from DS write for better pipelining.
+    # For 2/3-stage, DS_WRITE == GLOBAL_LOAD (combined load + store can't split).
+    # For 4+, all 4 stages are distinct.
+    2: (0, 0, 1, 1),
+    3: (0, 0, 1, 2),
+    4: (0, 1, 2, 3),
+    5: (0, 1, 3, 4),
 }
 
 
@@ -262,6 +265,7 @@ def constexpr_substitutions(m_tiles, n_tiles, k, num_stages):
     stride_c = n_tiles * 16 * 4
     shared_mem = (m_tiles + n_tiles) * 512
     stage_load, stage_sync, stage_compute = PIPELINE_STAGE_CONFIGS[num_stages]
+    stage_gl, stage_dw, stage_dr, stage_c = PIPELINE_STAGE_CONFIGS_4[num_stages]
 
     return {
         "{{M_T}}": str(m_tiles),
@@ -274,7 +278,12 @@ def constexpr_substitutions(m_tiles, n_tiles, k, num_stages):
         "{{STRIDE_AB}}": str(stride_ab),
         "{{STRIDE_C}}": str(stride_c),
         "{{SHARED_MEM}}": str(shared_mem),
+        # 3-stage names (backward compat with test_019)
         "{{STAGE_LOAD}}": str(stage_load),
         "{{STAGE_SYNC}}": str(stage_sync),
-        "{{STAGE_COMPUTE}}": str(stage_compute),
+        # 4-stage names (perf_001 split template)
+        "{{STAGE_GLOBAL_LOAD}}": str(stage_gl),
+        "{{STAGE_DS_WRITE}}": str(stage_dw),
+        "{{STAGE_DS_READ}}": str(stage_dr),
+        "{{STAGE_COMPUTE}}": str(stage_c),
     }
