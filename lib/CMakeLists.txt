@@ -22,7 +22,6 @@ add_mlir_library(ASTERInit
   LSIRDialect
   MLIRAffineDialect
   MLIRAffineTransforms
-  MLIRAMDGPUDialect
   MLIRArithDialect
   MLIRArithValueBoundsOpInterfaceImpl
   MLIRCAPIIR
