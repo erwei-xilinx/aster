@@ -2,14 +2,15 @@
 #  See https://llvm.org/LICENSE.txt for license information.
 #  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from ._amdgcn_ops_gen import *
-from ._amdgcn_enum_gen import *
-from ._ods_common import _cext as _ods_cext
+from aster.dialects._amdgcn_ops_gen import *
+from aster.dialects._amdgcn_enum_gen import *
+from aster.dialects._amdgcn_inst_gen import *
+from aster.dialects._ods_common import _cext as _ods_cext
 
 _ods_ir = _ods_cext.ir
 
-# Import register types from C++ bindings
-from .._mlir_libs._amdgcn import (
+from aster import ir
+from aster._mlir_libs._amdgcn import (
     AGPRType,
     AGPRRangeType,
     SGPRType,
@@ -18,20 +19,30 @@ from .._mlir_libs._amdgcn import (
     VGPRRangeType,
 )
 
-# Import API functions
-from . import api
+from typing import List, Optional, Union
 
-__all__ = [
-    "AGPRType",
-    "AGPRRangeType",
-    "SGPRType",
-    "SGPRRangeType",
-    "VGPRType",
-    "VGPRRangeType",
-    "api",
-]
+from aster.ir import register_attribute_builder
 
-from typing import Optional, Union
+
+def alloca_vgpr(reg: Optional[int] = None) -> ir.Value:
+    """Allocate a VGPR register."""
+    return AllocaOp(VGPRType.get(ir.Context.current, reg)).result
+
+
+def alloca_sgpr(reg: Optional[int] = None) -> ir.Value:
+    """Allocate an SGPR register."""
+    return AllocaOp(SGPRType.get(ir.Context.current, reg)).result
+
+
+def alloca_agpr(reg: Optional[int] = None) -> ir.Value:
+    """Allocate an AGPR register."""
+    return AllocaOp(AGPRType.get(ir.Context.current, reg)).result
+
+
+def make_register_range(inputs: List[ir.Value], *, results=None) -> ir.Value:
+    """Create a register range from a list of registers."""
+    input_values = [inp.result if hasattr(inp, "result") else inp for inp in inputs]
+    return MakeRegisterRangeOp(inputs=input_values, results=results).result
 
 
 @register_attribute_builder("AMDGCN_InstAttr")
@@ -126,7 +137,7 @@ def int_to_offset_value(
 ) -> _ods_ir.Value:
     """Convert an integer offset to an arith.constant Value, or return the Value as-is."""
     if isinstance(offset, int):
-        from ..dialects import arith
+        from aster.dialects import arith
 
         ctx = _ods_ir.Context.current
         int_type = _ods_ir.IntegerType.get_signless(32, ctx)
