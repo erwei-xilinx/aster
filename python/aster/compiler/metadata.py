@@ -55,25 +55,37 @@ class KernelResources:
         return ", ".join(parts)
 
     def check_occupancy(
-        self, num_threads: int, mcpu: str = "gfx942", num_wg_per_cu: int = 1
+        self,
+        num_threads: int,
+        mcpu: str = "gfx942",
+        num_wg_per_cu: int = 1,
+        target: "Optional[Target]" = None,
     ) -> List[str]:
         """Return a list of occupancy violations for the given target.
 
+        Args:
+            target: If provided, use this Target directly (e.g. from
+                Target.from_device() with runtime HIP values). Otherwise
+                fall back to Target.from_mcpu(mcpu) with hardcoded constants.
+
         Returns an empty list if the kernel can launch or the mcpu is unknown.
         """
-        try:
-            target = Target.from_mcpu(mcpu)
-        except ValueError:
-            return []
+        if target is None:
+            try:
+                target = Target.from_mcpu(mcpu)
+            except ValueError:
+                return []
         num_waves = (num_threads + target.wavefront_size - 1) // target.wavefront_size
         total_waves = num_waves * num_wg_per_cu
         waves_per_simd = (total_waves + target.num_simds - 1) // target.num_simds
         violations = []
 
+        # Per-wave register limits (ISA manual: "A wave may have up to 512
+        # total VGPRs, 256 of each type").
         if self.vgpr_count > target.max_vgprs:
-            violations.append(f"vgpr per thread {self.vgpr_count} > {target.max_vgprs}")
+            violations.append(f"vgpr per wave {self.vgpr_count} > {target.max_vgprs}")
         if target.max_agprs > 0 and self.agpr_count > target.max_agprs:
-            violations.append(f"agpr per thread {self.agpr_count} > {target.max_agprs}")
+            violations.append(f"agpr per wave {self.agpr_count} > {target.max_agprs}")
         combined = self.vgpr_count + self.agpr_count
         combined_max = target.max_vgprs + target.max_agprs
         if combined > combined_max:
@@ -81,24 +93,22 @@ class KernelResources:
                 f"(vgpr+agpr) per wave {self.vgpr_count}+{self.agpr_count}"
                 f"={combined} > {combined_max}"
             )
-        if target.unified_reg_file:
-            # CDNA3/CDNA4: VGPRs+AGPRs share a single physical file per SIMD.
+        # Per-CU register file constraint. The hardware CP rejects the dispatch
+        # (EC code 22, HSA_STATUS_ERROR_INVALID_ISA) when total register lanes
+        # exceed regsPerMultiprocessor (131072 on gfx942).
+        # Total lanes = align(regs_per_wave, granule) * num_waves * wavefront_size.
+        # Source: clr/rocclr/device/rocm/rocdevice.cpp:1604.
+        if target.unified_reg_file and waves_per_simd > 1:
             g = target.vgpr_alloc_granule
             aligned = (combined + g - 1) // g * g
-            total_simd = aligned * waves_per_simd
-            if total_simd > target.vgprs_per_simd:
+            wf = target.wavefront_size
+            lanes_needed = aligned * total_waves * wf
+            lanes_available = target.vgprs_per_simd * target.num_simds * wf
+            if lanes_needed > lanes_available:
                 violations.append(
-                    f"unified reg file per SIMD: aligned({self.vgpr_count}"
-                    f"+{self.agpr_count}, {g})={aligned} * {waves_per_simd}"
-                    f" waves = {total_simd} > {target.vgprs_per_simd}"
-                )
-        else:
-            # Separate VGPR and AGPR files (RDNA).
-            vgpr_simd = self.vgpr_count * waves_per_simd
-            if vgpr_simd > target.vgprs_per_simd:
-                violations.append(
-                    f"vgpr per SIMD {self.vgpr_count}*{waves_per_simd}"
-                    f"={vgpr_simd} > {target.vgprs_per_simd}"
+                    f"CU reg file: align{g}({self.vgpr_count}+{self.agpr_count})"
+                    f"={aligned} * {total_waves} waves * {wf} lanes"
+                    f" = {lanes_needed} > regsPerMultiprocessor ({lanes_available})"
                 )
         lds_budget = target.lds_per_cu // num_wg_per_cu
         if self.lds_bytes > lds_budget:
@@ -111,11 +121,9 @@ def compute_register_budget(
     mcpu: str = "gfx942",
     num_wg_per_cu: int = 1,
 ) -> Tuple[int, int, int]:
-    """Compute per-wave VGPR/AGPR limits and per-WG LDS limit from occupancy target.
+    """Compute per-wave VGPR/AGPR limits and per-WG LDS limit.
 
-    On CDNA3/CDNA4 (unified_reg_file=True), VGPRs and AGPRs share a single
-    physical file per SIMD. The returned max_vgprs reflects the unified budget:
-    vgpr + agpr must not exceed max_vgprs.
+    Per-wave limits from the ISA manual: 256 VGPRs, 256 AGPRs, 512 combined.
 
     Args:
         num_threads: Number of threads per workgroup.
@@ -134,17 +142,8 @@ def compute_register_budget(
         target = Target.from_mcpu(mcpu)
     except ValueError:
         target = Target.from_mcpu("gfx942")
-    num_waves = (num_threads + target.wavefront_size - 1) // target.wavefront_size
-    total_waves = num_waves * num_wg_per_cu
-    waves_per_simd = (total_waves + target.num_simds - 1) // target.num_simds
-    if target.unified_reg_file:
-        # Unified file: total (vgpr+agpr) per wave capped by file / waves.
-        max_total = target.vgprs_per_simd // waves_per_simd
-        max_vgprs = min(target.max_vgprs, max_total)
-        max_agprs = min(target.max_agprs, max_total)
-    else:
-        max_vgprs = min(target.max_vgprs, target.vgprs_per_simd // waves_per_simd)
-        max_agprs = min(target.max_agprs, target.agprs_per_simd // waves_per_simd)
+    max_vgprs = target.max_vgprs
+    max_agprs = target.max_agprs
     lds_per_wg = target.lds_per_cu // num_wg_per_cu
     return max_vgprs, max_agprs, lds_per_wg
 
