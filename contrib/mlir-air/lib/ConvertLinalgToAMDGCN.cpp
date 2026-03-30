@@ -6,9 +6,14 @@
 
 //===- ConvertLinalgToAMDGCN.cpp - linalg ops -> AMDGCN library calls -----===//
 
+#include "air/Dialect/AIR/AIRDialect.h"
+#include "aster/Dialect/AMDGCN/IR/AMDGCNAttrs.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNDialect.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "aster/Dialect/AMDGCN/IR/AMDGCNEnums.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNOps.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNTypes.h"
+#include "aster/Dialect/LSIR/IR/LSIRDialect.h"
 #include "aster/Dialect/LSIR/IR/LSIROps.h"
 #include "aster/Interfaces/ModuleOpInterface.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -16,6 +21,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Ptr/IR/PtrOps.h"
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
 #include "mlir/IR/Builders.h"
@@ -60,38 +66,69 @@ static void ensureDecl(OpBuilder &builder, Block &block, Location loc,
   builder.restoreInsertionPoint(savedIP);
 }
 
-/// Check if a memref value comes from promote to shared memory
-/// (memref.view(memref.alloca) with workgroup address space).
+/// Check if a memref value comes from promote to shared memory.
+/// Matches two patterns:
+///   1. memref.view(memref.alloca) with non-default memory space (from promote)
+///   2. memref.alloc with non-default memory space (from bufferize_to_allocation)
 static bool isPromotedBuffer(Value v) {
-  auto viewOp = v.getDefiningOp<memref::ViewOp>();
-  if (!viewOp)
+  // Pattern 1: memref.view(memref.alloca) — from transform.structured.promote.
+  if (auto viewOp = v.getDefiningOp<memref::ViewOp>()) {
+    if (auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>()) {
+      return allocaOp.getMemref().getType().getMemorySpace() != nullptr;
+    }
+  }
+  // Pattern 2: memref.alloc with L1/local memory space —
+  // from bufferize_to_allocation.
+  if (auto allocOp = v.getDefiningOp<memref::AllocOp>()) {
+    auto memSpace = allocOp.getMemref().getType().getMemorySpace();
+    if (!memSpace)
+      return false;
+    // Integer memory space 2 = L1 (AIR convention).
+    if (auto intAttr = dyn_cast<IntegerAttr>(memSpace))
+      return intAttr.getInt() == 2;
+    // #amdgcn.addr_space<local> = LDS.
+    if (auto addrSpace = dyn_cast<amdgcn::AddressSpaceAttr>(memSpace))
+      return addrSpace.getSpace() == amdgcn::AddressSpaceKind::Local;
     return false;
-  auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>();
-  if (!allocaOp)
-    return false;
-  auto memSpace = allocaOp.getMemref().getType().getMemorySpace();
-  return memSpace != nullptr;
+  }
+  return false;
 }
 
 /// Emit amdgcn.alloc_lds + get_lds_offset for a promoted buffer.
-/// Uses a cache so the same promoted buffer (same memref.view(memref.alloca))
-/// gets the same LDS region for both write (copy) and read (matmul).
+/// Uses a cache so the same promoted buffer gets the same LDS region
+/// for both write (copy) and read (matmul).
 static Value emitLDSOffset(OpBuilder &builder, Location loc, Value memrefVal,
                            DenseMap<Value, Value> &ldsCache) {
   auto it = ldsCache.find(memrefVal);
   if (it != ldsCache.end())
     return it->second;
 
-  auto viewOp = memrefVal.getDefiningOp<memref::ViewOp>();
-  auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>();
-  int64_t sizeBytes = allocaOp.getMemref().getType().getNumElements();
+  int64_t sizeBytes = 0;
+  Value byteShift;
+
+  // Pattern 1: memref.view(memref.alloca) — from promote.
+  if (auto viewOp = memrefVal.getDefiningOp<memref::ViewOp>()) {
+    auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>();
+    sizeBytes = allocaOp.getMemref().getType().getNumElements();
+    byteShift = viewOp.getByteShift();
+  }
+  // Pattern 2: memref.alloc — from bufferize_to_allocation.
+  else if (auto allocOp = memrefVal.getDefiningOp<memref::AllocOp>()) {
+    auto mrTy = allocOp.getMemref().getType();
+    unsigned eltBits = mrTy.getElementType().getIntOrFloatBitWidth();
+    sizeBytes = mrTy.getNumElements() * eltBits / 8;
+  }
+
   auto ldsAlloc = AllocLDSOp::create(builder, loc, /*dynamic_size=*/Value(),
                                      sizeBytes, /*alignment=*/16,
                                      /*offset=*/IntegerAttr{});
   auto ldsOffset =
       GetLDSOffsetOp::create(builder, loc, builder.getIndexType(), ldsAlloc);
-  Value result = builder.create<arith::AddIOp>(loc, ldsOffset.getResult(),
-                                               viewOp.getByteShift());
+
+  Value result = ldsOffset.getResult();
+  if (byteShift)
+    result = builder.create<arith::AddIOp>(loc, result, byteShift);
+
   ldsCache[memrefVal] = result;
   return result;
 }
@@ -145,6 +182,14 @@ static void replaceWithCall(OpBuilder &builder, Block &declBlock, Operation *op,
                             StringRef namePrefix,
                             SmallVector<Operation *> &toErase,
                             DenseMap<Value, Value> &ldsCache) {
+  // Only convert ops that involve at least one promoted (LDS) buffer.
+  bool hasPromotedOperand = false;
+  for (Value operand : op->getOperands())
+    if (isPromotedBuffer(operand))
+      hasPromotedOperand = true;
+  if (!hasPromotedOperand)
+    return;
+
   auto indexTy = builder.getIndexType();
   SmallVector<Value> callArgs;
   SmallVector<Type> argTypes;
@@ -170,13 +215,42 @@ static void replaceWithCall(OpBuilder &builder, Block &declBlock, Operation *op,
         callArgs.push_back(emitLDSOffset(builder, loc, operand, ldsCache));
         argTypes.push_back(indexTy);
       } else {
-        // Decompose global memref into (!sx2, byte_stride)
+        // Global memref: if this is a subview, decompose the BASE memref
+        // (clean sgpr) and pass tile offsets separately. This avoids
+        // baking wavefront-varying offsets into the pointer.
+        Value baseMemref = operand;
+        SmallVector<Value> tileOffsets;
+        if (auto svOp = operand.getDefiningOp<memref::SubViewOp>()) {
+          baseMemref = svOp.getSource();
+          for (auto off : svOp.getMixedOffsets()) {
+            if (auto val = dyn_cast<Value>(off))
+              tileOffsets.push_back(val);
+            else
+              tileOffsets.push_back(arith::ConstantIndexOp::create(
+                  builder, loc,
+                  cast<IntegerAttr>(off.get<Attribute>()).getInt()));
+          }
+        }
         auto [ptrVal, byteStride] =
-            decomposeGlobalMemref(builder, loc, operand);
+            decomposeGlobalMemref(builder, loc, baseMemref);
         callArgs.push_back(ptrVal);
         argTypes.push_back(sx2Ty);
         callArgs.push_back(byteStride);
         argTypes.push_back(indexTy);
+        // Pass tile offsets (or zeros if no subview).
+        if (tileOffsets.empty()) {
+          auto rank = mrTy.getRank();
+          for (int64_t i = 0; i < rank; ++i) {
+            callArgs.push_back(
+                arith::ConstantIndexOp::create(builder, loc, 0));
+            argTypes.push_back(indexTy);
+          }
+        } else {
+          for (auto off : tileOffsets) {
+            callArgs.push_back(off);
+            argTypes.push_back(indexTy);
+          }
+        }
       }
     } else {
       callArgs.push_back(operand);
@@ -198,6 +272,11 @@ struct ConvertLinalgToAMDGCN
   StringRef getDescription() const override {
     return "Convert tiled linalg ops to AMDGCN library calls";
   }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<ptr::PtrDialect>();
+    registry.insert<lsir::LSIRDialect>();
+    registry.insert<amdgcn::AMDGCNDialect>();
+  }
 
   void runOnOperation() override {
     Operation *moduleOp = getOperation();
@@ -211,17 +290,130 @@ struct ConvertLinalgToAMDGCN
     SmallVector<Operation *> toErase;
     DenseMap<Value, Value> ldsCache;
 
+    // Pre-allocate LDS at function entry for channel get destinations FIRST,
+    // before processing linalg ops. This ensures the matmul (which shares the
+    // same memref.alloc as the channel.get) hits the cache and uses the
+    // function-entry LDS offset instead of creating one inside the loop.
+    DenseMap<StringRef, SmallVector<xilinx::air::ChannelPutOp>> putsByChannel;
+    moduleOp->walk([&](xilinx::air::ChannelPutOp put) {
+      putsByChannel[put.getChanName()].push_back(put);
+    });
+    // Determine number of wavefronts from channel array dimensions.
+    int64_t numWavefronts = 1;
+    moduleOp->walk([&](xilinx::air::ChannelOp chan) {
+      auto sizes = chan.getSize();
+      int64_t total = 1;
+      for (auto s : sizes)
+        total *= cast<IntegerAttr>(s).getInt();
+      if (total > numWavefronts)
+        numWavefronts = total;
+    });
+
+    // Pre-allocate LDS for channel get destinations (Global→LDS direction).
+    // Each wavefront gets its own LDS region: alloc numWavefronts * size,
+    // offset by wavefront_id * size.
+    moduleOp->walk([&](xilinx::air::ChannelGetOp get) {
+      Value dst = get.getDst();
+      if (!isPromotedBuffer(dst))
+        return;
+      auto funcOp = get->getParentOfType<func::FuncOp>();
+      if (!funcOp || funcOp.empty())
+        return;
+      auto savedIP = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(&funcOp.front());
+      Location loc = funcOp.getLoc();
+
+      // Get per-wavefront tile size.
+      int64_t tileSizeBytes = 0;
+      if (auto allocOp = dst.getDefiningOp<memref::AllocOp>()) {
+        auto mrTy = allocOp.getMemref().getType();
+        unsigned eltBits = mrTy.getElementType().getIntOrFloatBitWidth();
+        tileSizeBytes = mrTy.getNumElements() * eltBits / 8;
+      }
+
+      // Allocate numWavefronts * tileSizeBytes.
+      auto ldsAlloc = AllocLDSOp::create(builder, loc, /*dynamic_size=*/Value(),
+                                         numWavefronts * tileSizeBytes,
+                                         /*alignment=*/16,
+                                         /*offset=*/IntegerAttr{});
+      auto ldsBaseOffset =
+          GetLDSOffsetOp::create(builder, loc, builder.getIndexType(), ldsAlloc);
+
+      // Per-wavefront offset: base + wavefront_id * tileSizeBytes.
+      Value wavefrontSize =
+          arith::ConstantIndexOp::create(builder, loc, 64);
+      Value threadIdX =
+          gpu::ThreadIdOp::create(builder, loc, gpu::Dimension::x);
+      Value wavefrontId =
+          arith::DivUIOp::create(builder, loc, threadIdX, wavefrontSize);
+      Value tileSizeVal =
+          arith::ConstantIndexOp::create(builder, loc, tileSizeBytes);
+      Value wavefrontOffset =
+          arith::MulIOp::create(builder, loc, wavefrontId, tileSizeVal);
+      Value adjustedOffset = builder.create<arith::AddIOp>(
+          loc, ldsBaseOffset.getResult(), wavefrontOffset);
+
+      ldsCache[dst] = adjustedOffset;
+      builder.restoreInsertionPoint(savedIP);
+    });
+    // Pre-allocate LDS for channel put sources (LDS→Global direction).
+    moduleOp->walk([&](xilinx::air::ChannelPutOp put) {
+      Value src = put.getSrc();
+      if (!isPromotedBuffer(src))
+        return;
+      if (ldsCache.count(src))
+        return; // Already allocated (shared with channel get).
+      auto funcOp = put->getParentOfType<func::FuncOp>();
+      if (!funcOp || funcOp.empty())
+        return;
+      auto savedIP = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(&funcOp.front());
+      Location loc = funcOp.getLoc();
+
+      int64_t tileSizeBytes = 0;
+      if (auto allocOp = src.getDefiningOp<memref::AllocOp>()) {
+        auto mrTy = allocOp.getMemref().getType();
+        unsigned eltBits = mrTy.getElementType().getIntOrFloatBitWidth();
+        tileSizeBytes = mrTy.getNumElements() * eltBits / 8;
+      }
+
+      auto ldsAlloc = AllocLDSOp::create(builder, loc, /*dynamic_size=*/Value(),
+                                         numWavefronts * tileSizeBytes,
+                                         /*alignment=*/16,
+                                         /*offset=*/IntegerAttr{});
+      auto ldsBaseOffset =
+          GetLDSOffsetOp::create(builder, loc, builder.getIndexType(), ldsAlloc);
+
+      Value wavefrontSize =
+          arith::ConstantIndexOp::create(builder, loc, 64);
+      Value threadIdX =
+          gpu::ThreadIdOp::create(builder, loc, gpu::Dimension::x);
+      Value wavefrontId =
+          arith::DivUIOp::create(builder, loc, threadIdX, wavefrontSize);
+      Value tileSizeVal =
+          arith::ConstantIndexOp::create(builder, loc, tileSizeBytes);
+      Value wavefrontOffset =
+          arith::MulIOp::create(builder, loc, wavefrontId, tileSizeVal);
+      Value adjustedOffset = builder.create<arith::AddIOp>(
+          loc, ldsBaseOffset.getResult(), wavefrontOffset);
+
+      ldsCache[src] = adjustedOffset;
+      builder.restoreInsertionPoint(savedIP);
+    });
+
+    // Now process linalg ops — they'll hit the ldsCache for shared allocs.
     moduleOp->walk([&](linalg::FillOp op) {
       replaceWithCall(builder, declBlock, op, "fill", toErase, ldsCache);
     });
     moduleOp->walk([&](linalg::CopyOp op) {
       replaceWithCall(builder, declBlock, op, "copy", toErase, ldsCache);
     });
+    moduleOp->walk([&](memref::CopyOp op) {
+      replaceWithCall(builder, declBlock, op, "copy", toErase, ldsCache);
+    });
     moduleOp->walk([&](linalg::MatmulOp op) {
       replaceWithCall(builder, declBlock, op, "mfma_matmul", toErase, ldsCache);
     });
-    // Also handle linalg.generic with matmul-like semantics (e.g.,
-    // matmul_transpose_b expressed as generic with (m,n,k)->(m,k),(n,k),(m,n)).
     moduleOp->walk([&](linalg::GenericOp op) {
       if (op.getNumDpsInputs() == 2 && op.getNumDpsInits() == 1 &&
           op.getNumReductionLoops() == 1)
@@ -229,8 +421,149 @@ struct ConvertLinalgToAMDGCN
                         ldsCache);
     });
 
+    // Emit copy call at each put site (where global src operands dominate).
+    moduleOp->walk([&](xilinx::air::ChannelGetOp get) {
+      StringRef chanName = get.getChanName();
+      auto it = putsByChannel.find(chanName);
+      if (it == putsByChannel.end() || it->second.empty())
+        return;
+      xilinx::air::ChannelPutOp put = it->second.front();
+
+      Value dst = get.getDst();
+      auto dstTy = dyn_cast<MemRefType>(dst.getType());
+      if (!dstTy)
+        return;
+
+      Value src = put.getSrc();
+      bool srcIsLDS = isPromotedBuffer(src);
+      bool dstIsLDS = isPromotedBuffer(dst);
+
+      // Determine direction and emit at the appropriate site.
+      // Global→LDS: emit at put site (global src operands dominate).
+      // LDS→Global: emit at get site (global dst operands dominate).
+      if (srcIsLDS && !dstIsLDS) {
+        // LDS→Global (C write-back): emit at get site.
+        builder.setInsertionPoint(get);
+      } else {
+        // Global→LDS (A/B copy): emit at put site.
+        builder.setInsertionPoint(put);
+      }
+      Location loc = builder.getInsertionPoint()->getLoc();
+
+      // Use the L1 (smaller) memref type for the function name.
+      auto namingTy = srcIsLDS ? cast<MemRefType>(src.getType()) : dstTy;
+      std::string name = buildFuncName("copy", namingTy);
+
+      auto indexTy = builder.getIndexType();
+      auto sx2Ty = amdgcn::SGPRType::get(ctx, Register(),
+                                         /*size=*/2, /*alignment=*/2);
+      SmallVector<Value> callArgs;
+      SmallVector<Type> argTypes;
+
+      // Decompose src side.
+      if (srcIsLDS) {
+        // LDS src.
+        assert(ldsCache.count(src) && "LDS offset not pre-allocated for channel put src");
+        callArgs.push_back(ldsCache[src]);
+        argTypes.push_back(indexTy);
+      } else {
+        // Global src: decompose BASE memref (not subview) to get a clean
+        // sgpr pointer. Pass the channel's tile offsets separately so the
+        // library function handles them (kittens pattern).
+        auto [ptrVal, byteStride] =
+            decomposeGlobalMemref(builder, loc, src);
+        callArgs.push_back(ptrVal);
+        argTypes.push_back(sx2Ty);
+        callArgs.push_back(byteStride);
+        argTypes.push_back(indexTy);
+        // Tile offsets from the channel put (element-level indices).
+        auto putOffsets = put.getSrcOffsets();
+        if (putOffsets.size() >= 2) {
+          callArgs.push_back(putOffsets[0]); // row offset
+          argTypes.push_back(indexTy);
+          callArgs.push_back(putOffsets[1]); // col offset
+          argTypes.push_back(indexTy);
+        } else {
+          Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
+          callArgs.push_back(c0);
+          argTypes.push_back(indexTy);
+          callArgs.push_back(c0);
+          argTypes.push_back(indexTy);
+        }
+      }
+
+      // Decompose dst side.
+      if (dstIsLDS) {
+        // LDS dst.
+        assert(ldsCache.count(dst) && "LDS offset not pre-allocated for channel get dst");
+        callArgs.push_back(ldsCache[dst]);
+        argTypes.push_back(indexTy);
+      } else {
+        // Global dst: decompose BASE memref, pass offsets separately.
+        auto [ptrVal, byteStride] =
+            decomposeGlobalMemref(builder, loc, dst);
+        callArgs.push_back(ptrVal);
+        argTypes.push_back(sx2Ty);
+        callArgs.push_back(byteStride);
+        argTypes.push_back(indexTy);
+        auto getOffsets = get.getDstOffsets();
+        if (getOffsets.size() >= 2) {
+          callArgs.push_back(getOffsets[0]);
+          argTypes.push_back(indexTy);
+          callArgs.push_back(getOffsets[1]);
+          argTypes.push_back(indexTy);
+        } else {
+          Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
+          callArgs.push_back(c0);
+          argTypes.push_back(indexTy);
+          callArgs.push_back(c0);
+          argTypes.push_back(indexTy);
+        }
+      }
+
+      auto funcTy = builder.getFunctionType(argTypes, {});
+      ensureDecl(builder, declBlock, loc, name, funcTy);
+      func::CallOp::create(builder, loc, name, TypeRange{}, callArgs);
+
+      toErase.push_back(put);
+      toErase.push_back(get);
+    });
+
+    // Clean up channel declarations.
+    moduleOp->walk([&](xilinx::air::ChannelOp chan) {
+      toErase.push_back(chan);
+    });
+
     for (auto *op : toErase)
       op->erase();
+
+    // Erase linalg.fill on global buffers — the library handles zero-init.
+    SmallVector<linalg::FillOp> globalFills;
+    moduleOp->walk([&](linalg::FillOp fill) {
+      for (Value out : fill.getDpsInits()) {
+        if (auto mrTy = dyn_cast<MemRefType>(out.getType()))
+          if (!isPromotedBuffer(out))
+            globalFills.push_back(fill);
+      }
+    });
+    for (auto fill : globalFills)
+      fill->erase();
+
+    // Eliminate global→global memref.copy by forwarding the destination.
+    // This handles the `memref.copy %alloc, %arg` from materialize_in_destination.
+    moduleOp->walk([&](memref::CopyOp copy) {
+      Value src = copy.getSource();
+      Value dst = copy.getTarget();
+      if (isPromotedBuffer(src) || isPromotedBuffer(dst))
+        return;
+      // Both are global — replace all uses of src with dst and erase.
+      if (auto allocOp = src.getDefiningOp<memref::AllocOp>()) {
+        src.replaceAllUsesWith(dst);
+        copy->erase();
+        if (allocOp->use_empty())
+          allocOp->erase();
+      }
+    });
 
     // DCE unused alloca/view/dealloc.
     SmallVector<Operation *> deadOps;
