@@ -38,6 +38,7 @@ from test_perf_001_gemm_fp16_weak_scaled import (
 from bench_harness import (
     add_sweep_cli_args,
     bench_perf_sweep,
+    bench_perf_sweep_pipelined,
     make_sweep_pins,
 )
 
@@ -389,7 +390,7 @@ def verify_top_configs(
         print(" -- all correct")
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
         description="Weak-scaled 16x16+dwordx4 GEMM benchmark sweep",
     )
@@ -469,7 +470,6 @@ if __name__ == "__main__":
         metavar="{0..10}",
         help="Pin pipeline strategy",
     )
-
     args = parser.parse_args()
 
     # Build load_type list from --use-buffer and --use-flat.
@@ -539,7 +539,8 @@ if __name__ == "__main__":
     def _post_compile_filter(cfg, res):
         return fits_on_cu_post_compile(cfg, res)
 
-    results = bench_perf_sweep(
+    sweep_fn = bench_perf_sweep_pipelined
+    results = sweep_fn(
         configs=all_configs,
         compile_fn=compile_gemm,
         repro_cmd_fn=_repro_cmd,
@@ -548,6 +549,15 @@ if __name__ == "__main__":
         compile_timeout=getattr(args, "compile_timeout", 60),
         post_compile_filter=_post_compile_filter,
         exec_sample=getattr(args, "exec_sample", 2000),
+        zero_init=args.zero_init,
     )
     results, hsaco_map = results
     verify_top_configs(results, hsaco_map, num_gpus=args.num_gpus)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(130)
