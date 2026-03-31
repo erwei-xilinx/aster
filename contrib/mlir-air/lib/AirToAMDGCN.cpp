@@ -15,7 +15,7 @@
 //   air.execute       -> inline body (strip async)
 //   air.wait_all     -> erase
 //
-// air.channel.put/get are preserved for the convert-air-channel-to-amdgcn pass.
+// air.channel.put/get are not expected after air-to-amdgcn (air-dma-to-channel not used).
 //===----------------------------------------------------------------------===//
 
 #include "air/Dialect/AIR/AIRDialect.h"

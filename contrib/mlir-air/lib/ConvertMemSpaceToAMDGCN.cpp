@@ -16,7 +16,7 @@
 // integer memory spaces) and aster's AMDGCN decomposition passes (which
 // require #amdgcn.addr_space attributes for pointer generation).
 //
-// Run after air-to-amdgcn and before convert-air-channel-to-amdgcn.
+// Run after air-to-amdgcn and before convert-linalg-to-amdgcn.
 //===----------------------------------------------------------------------===//
 
 #include "aster/Dialect/AMDGCN/IR/AMDGCNAttrs.h"

@@ -52,9 +52,18 @@ if(ASTER_ENABLE_MLIR_AIR)
       -Wl,--whole-archive $<TARGET_FILE:MlirAirLib> -Wl,--no-whole-archive)
   endif()
   target_link_libraries(ASTER PRIVATE
+    AIRDialect
+    AIRTransformOps
+    AIRTransformPasses
+    AIRConversionPasses
+    MLIRBufferizationDialect
+    MLIRBufferizationTransformOps
+    MLIRBufferizationTransforms
     MLIRLinalgDialect
     MLIRLinalgTransformOps
     MLIRLinalgTransforms
+    MLIRTensorInferTypeOpInterfaceImpl
+    MLIRTensorTransforms
     MLIRTransformDialect
     MLIRTransformDialectTransforms
     MLIRSCFTransformOps
