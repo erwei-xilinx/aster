@@ -28,6 +28,10 @@ MCPU = "gfx942"
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _MLIR_FILE = os.path.join(_THIS_DIR, "..", "air-to-amdgcn-matmul.mlir")
 _TRANSFORM_FILE = os.path.join(_THIS_DIR, "..", "air-to-amdgcn-matmul-transform.mlir")
+_PADDED_MLIR_FILE = os.path.join(_THIS_DIR, "..", "air-to-amdgcn-matmul-padded.mlir")
+_PADDED_TRANSFORM_FILE = os.path.join(
+    _THIS_DIR, "..", "air-to-amdgcn-matmul-padded-transform.mlir"
+)
 _LIBRARY_DIR = os.path.join(
     _THIS_DIR, "..", "..", "..", "..", "mlir_kernels", "library"
 )
@@ -67,13 +71,13 @@ def _find_mlir_air_opt():
     pytest.skip("mlir-air-opt not found")
 
 
-def _air_preprocess(mlir_text):
+def _air_preprocess_with_files(mlir_text, transform_file):
     """Run the full AIR lowering pipeline before handing to aster."""
     opt = _find_mlir_air_opt()
     result = subprocess.run(
         [
             opt,
-            f"--transform-preload-library=transform-library-paths={_TRANSFORM_FILE}",
+            f"--transform-preload-library=transform-library-paths={transform_file}",
             "--transform-interpreter",
             "--air-par-to-herd",
             "--canonicalize", "--cse",
@@ -94,6 +98,10 @@ def _air_preprocess(mlir_text):
         raise RuntimeError(
             f"mlir-air-opt AIR preprocessing failed:\n{result.stderr}")
     return result.stdout
+
+
+def _air_preprocess(mlir_text):
+    return _air_preprocess_with_files(mlir_text, _TRANSFORM_FILE)
 
 
 def _post_air_pipeline(library_paths):
@@ -133,3 +141,42 @@ class TestAirMatmulE2E:
 
         expected = (A.astype(np.float32) @ B_KxN.astype(np.float32)).flatten()
         np.testing.assert_allclose(C, expected, rtol=1e-2, atol=1e-2)
+
+    def test_matmul_padded_40x40(self):
+        """Matmul with non-tile-aligned dimensions: actual 40x40, padded to 48x48."""
+        M_actual, N_actual, K = 40, 40, 64
+        M_pad, N_pad = 48, 48  # next multiple of 16
+
+        np.random.seed(42)
+        A_actual = (np.random.randn(M_actual, K) * 0.1).astype(np.float16)
+        B_actual = (np.random.randn(N_actual, K) * 0.1).astype(np.float16)
+
+        # Pad A and B to tile-aligned sizes (zero-fill padding region).
+        A_padded = np.zeros((M_pad, K), dtype=np.float16)
+        A_padded[:M_actual, :] = A_actual
+        B_padded = np.zeros((N_pad, K), dtype=np.float16)
+        B_padded[:N_actual, :] = B_actual
+
+        C = np.zeros(M_pad * N_pad, dtype=np.float32)
+
+        def padded_preprocess(mlir_text):
+            return _air_preprocess_with_files(
+                mlir_text, _PADDED_TRANSFORM_FILE)
+
+        compile_and_run(
+            file_name=_PADDED_MLIR_FILE,
+            kernel_name="matmul_f16_48x48",
+            input_data=[A_padded.flatten(), B_padded.flatten()],
+            output_data=[C],
+            pass_pipeline=_post_air_pipeline(_LIBRARY_PATHS),
+            library_paths=[],
+            grid_dim=(1, 1, 1),
+            block_dim=(192, 1, 1),  # 3 wavefronts (3x1 herd)
+            preprocess=padded_preprocess,
+        )
+
+        # Extract valid 40x40 region and compare.
+        C_2d = C.reshape(M_pad, N_pad)
+        C_valid = C_2d[:M_actual, :N_actual].flatten()
+        expected = (A_actual.astype(np.float32) @ B_actual.T.astype(np.float32)).flatten()
+        np.testing.assert_allclose(C_valid, expected, rtol=1e-2, atol=1e-2)
