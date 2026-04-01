@@ -1,6 +1,6 @@
 add_mlir_library(MlirAirLib
   lib/AirToAMDGCN.cpp
-  lib/ConvertLinalgToAMDGCN.cpp
+  lib/ConvertToAMDGCNLibraryCalls.cpp
   lib/ConvertMemSpaceToAMDGCN.cpp
   lib/Init.cpp
   lib/Pipelines.cpp

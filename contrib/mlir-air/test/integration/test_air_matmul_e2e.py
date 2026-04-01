@@ -9,7 +9,7 @@ Pipeline:
     --air-copy-to-dma (memref.copy → air.dma_memcpy_nd)
     --air-to-amdgcn (flatten hierarchy, herd → wavefront index)
     --convert-memspace-to-amdgcn (integer memspace → #amdgcn.addr_space)
-    --convert-linalg-to-amdgcn (air.dma_memcpy_nd + linalg ops → library calls)
+    --convert-to-amdgcn-library-calls (air.dma_memcpy_nd + linalg ops → library calls)
   then aster pipeline:
     --preload → inline → mlir-air-to-asm
 """
@@ -85,7 +85,7 @@ def _air_preprocess(mlir_text):
             "--air-to-amdgcn",
             "--canonicalize",
             "--convert-memspace-to-amdgcn",
-            "--convert-linalg-to-amdgcn",
+            "--convert-to-amdgcn-library-calls",
         ],
         input=mlir_text,
         capture_output=True, text=True,
@@ -115,7 +115,7 @@ class TestAirMatmulE2E:
         A = (np.random.randn(M, K) * 0.1).astype(np.float16)
         B_KxN = (np.random.randn(K, N) * 0.1).astype(np.float16)
         B_T = np.ascontiguousarray(B_KxN.T)
-        # C must be zero-initialized (fill is erased by convert-linalg-to-amdgcn;
+        # C must be zero-initialized (fill is erased by convert-to-amdgcn-library-calls;
         # the library's zero_C handles accumulator init per tile).
         C = np.zeros(M * N, dtype=np.float32)
 
