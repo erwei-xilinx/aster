@@ -145,48 +145,20 @@ class TestAirMatmulE2E:
     def test_matmul_padded_40x40(self):
         """Matmul with non-tile-aligned dimensions: actual 40x40x64.
 
-        Kernel operates on actual dimensions (memref<40x64xf16>, memref<40x40xf32>).
-        Transform pads boundary tiles to 16. Host over-allocates C to 48*48
-        to accommodate OOB stores from boundary tiles.
+        pad_tiling_interface pads M,N from 40→48 at the iteration domain level.
+        After padding, all tiles are full (48 % 16 == 0). No affine.min bounds.
+        The padding is internal to the tensor computation; the C memref stays 40x40.
         """
         M, N, K = 40, 40, 64
-        M_pad = 48  # next multiple of 16, for C over-allocation
 
         np.random.seed(42)
         A = (np.random.randn(M, K) * 0.1).astype(np.float16)
         B_T = (np.random.randn(N, K) * 0.1).astype(np.float16)
-
-        # Over-allocate C: kernel writes full 16x16 tiles at boundaries,
-        # going beyond 40x40. Allocate 48*48 elements but pass as 40x40 memref.
-        C = np.zeros(M_pad * M_pad, dtype=np.float32)
+        C = np.zeros(M * N, dtype=np.float32)
 
         def padded_preprocess(mlir_text):
-            opt = _find_mlir_air_opt()
-            result = subprocess.run(
-                [
-                    opt,
-                    f"--transform-preload-library=transform-library-paths={_PADDED_TRANSFORM_FILE}",
-                    "--transform-interpreter",
-                    "--canonicalize", "--cse",
-                    # Set memory_space=2 on padding allocs (no memory space → L1).
-                    "--air-override-memref-memory-space=scope=func memory-space=2",
-                    "--air-par-to-herd",
-                    "--canonicalize", "--cse",
-                    "--air-par-to-launch=has-air-segment=true",
-                    "--canonicalize", "--cse",
-                    "--air-copy-to-dma",
-                    "--air-to-amdgcn",
-                    "--canonicalize",
-                    "--convert-memspace-to-amdgcn",
-                    "--convert-to-amdgcn-library-calls",
-                ],
-                input=mlir_text,
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"mlir-air-opt padded preprocessing failed:\n{result.stderr}")
-            return result.stdout
+            return _air_preprocess_with_files(
+                mlir_text, _PADDED_TRANSFORM_FILE)
 
         compile_and_run(
             file_name=_PADDED_MLIR_FILE,
@@ -200,8 +172,5 @@ class TestAirMatmulE2E:
             preprocess=padded_preprocess,
         )
 
-        # Extract valid 40x40 region (C is over-allocated as flat 48*48).
-        # The kernel writes with stride=40, so reinterpret accordingly.
-        C_2d = C[:M * M_pad].reshape(-1, M_pad)[:M, :N].flatten()
         expected = (A.astype(np.float32) @ B_T.T.astype(np.float32)).flatten()
-        np.testing.assert_allclose(C_2d, expected, rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(C, expected, rtol=1e-2, atol=1e-2)
