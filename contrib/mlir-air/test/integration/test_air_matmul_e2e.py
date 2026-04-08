@@ -7,10 +7,9 @@ Pipeline:
     --one-shot-bufferize
     --air-par-to-launch (outer parallel → launch)
     --air-copy-to-dma (memref.copy → air.dma_memcpy_nd)
-    --air-dma-to-channel (DMA → air.channel.put/get)
     --air-to-amdgcn (flatten hierarchy, herd → wavefront index)
     --convert-memspace-to-amdgcn (integer memspace → #amdgcn.addr_space)
-    --convert-linalg-to-amdgcn (linalg + channels → library calls)
+    --convert-linalg-to-amdgcn (air.dma_memcpy_nd + linalg ops → library calls)
   then aster pipeline:
     --preload → inline → mlir-air-to-asm
 """
@@ -81,7 +80,6 @@ def _air_preprocess(mlir_text):
             "--air-par-to-launch=has-air-segment=true",
             "--canonicalize", "--cse",
             "--air-copy-to-dma",
-            "--air-dma-to-channel",
             "--air-to-amdgcn",
             "--canonicalize",
             "--convert-memspace-to-amdgcn",

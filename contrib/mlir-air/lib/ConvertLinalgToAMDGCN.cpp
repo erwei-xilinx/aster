@@ -278,6 +278,7 @@ struct ConvertLinalgToAMDGCN
     registry.insert<amdgcn::AMDGCNDialect>();
   }
 
+
   void runOnOperation() override {
     Operation *moduleOp = getOperation();
     MLIRContext *ctx = &getContext();
@@ -399,6 +400,168 @@ struct ConvertLinalgToAMDGCN
 
       ldsCache[src] = adjustedOffset;
       builder.restoreInsertionPoint(savedIP);
+    });
+
+    // Detect numWavefronts from the IR.
+    // air-to-amdgcn emits: wavefrontId = gpu.thread_id x / 64
+    // The affine.apply for M row uses: #map()[%loop_var, %wavefrontId]
+    //   = loop_var + wavefrontId * herdTileM
+    // numWavefronts = totalM / herdTileM.
+    // We find herdTileM from the coefficient of the wavefrontId symbol in the
+    // affine map by scanning AffineApplyOp users of the divui result.
+    int64_t detectedNumWavefronts = 1;
+    moduleOp->walk([&](arith::DivUIOp divOp) {
+      if (detectedNumWavefronts > 1)
+        return;
+      auto threadId = divOp.getLhs().getDefiningOp<gpu::ThreadIdOp>();
+      if (!threadId || threadId.getDimension() != gpu::Dimension::x)
+        return;
+      auto cst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
+      if (!cst || cst.value() != 64)
+        return;
+      // wavefrontId = divOp.getResult(). Find its use in affine.apply.
+      for (Operation *user : divOp.getResult().getUsers()) {
+        auto applyOp = dyn_cast<affine::AffineApplyOp>(user);
+        if (!applyOp || applyOp.getAffineMap().getNumResults() != 1)
+          continue;
+        // Find the position of wavefrontId in the operand list.
+        unsigned wfPos = 0;
+        bool found = false;
+        for (auto [idx, operand] : llvm::enumerate(applyOp.getMapOperands())) {
+          if (operand == divOp.getResult()) {
+            wfPos = idx;
+            found = true;
+            break;
+          }
+        }
+        if (!found)
+          continue;
+        // Extract coefficient of symbol/dim at wfPos in the affine map.
+        AffineMap map = applyOp.getAffineMap();
+        // The map operands are pure symbols in this context.
+        int64_t stride = 0;
+        AffineExpr expr = map.getResult(0);
+        expr.walk([&](AffineExpr e) {
+          auto mul = dyn_cast<AffineBinaryOpExpr>(e);
+          if (!mul || mul.getKind() != AffineExprKind::Mul)
+            return;
+          auto sym = dyn_cast<AffineSymbolExpr>(mul.getLHS());
+          auto con = dyn_cast<AffineConstantExpr>(mul.getRHS());
+          if (!sym || !con)
+            return;
+          if (sym.getPosition() == wfPos)
+            stride = con.getValue();
+        });
+        if (stride <= 0)
+          continue;
+        // Get totalM from DMA src memref.
+        moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma2) {
+          if (detectedNumWavefronts > 1)
+            return;
+          Value src = dma2.getSrcMemref();
+          auto srcTy = dyn_cast<MemRefType>(src.getType());
+          if (!srcTy || srcTy.getRank() < 1 || srcTy.getDimSize(0) <= 0)
+            return;
+          detectedNumWavefronts = srcTy.getDimSize(0) / stride;
+        });
+      }
+    });
+
+    // Pre-allocate LDS for air.dma_memcpy_nd destinations (no-channel path).
+    // Must run before linalg op processing so matmul hits the same ldsCache.
+    // Allocate numWavefronts * tileSizeBytes and stripe by wavefront_id.
+    moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma) {
+      Value dst = dma.getDstMemref();
+      if (!isPromotedBuffer(dst) || ldsCache.count(dst))
+        return;
+      auto funcOp = dma->getParentOfType<func::FuncOp>();
+      if (!funcOp || funcOp.empty())
+        return;
+      auto savedIP = builder.saveInsertionPoint();
+      builder.setInsertionPointToStart(&funcOp.front());
+      Location loc = funcOp.getLoc();
+
+      int64_t tileSizeBytes = 0;
+      if (auto allocOp = dst.getDefiningOp<memref::AllocOp>()) {
+        auto mrTy = allocOp.getMemref().getType();
+        unsigned eltBits = mrTy.getElementType().getIntOrFloatBitWidth();
+        tileSizeBytes = mrTy.getNumElements() * eltBits / 8;
+      }
+      int64_t nWf = detectedNumWavefronts;
+      auto ldsAlloc = AllocLDSOp::create(builder, loc, /*dynamic_size=*/Value(),
+                                         nWf * tileSizeBytes, /*alignment=*/16,
+                                         /*offset=*/IntegerAttr{});
+      auto ldsBaseOffset =
+          GetLDSOffsetOp::create(builder, loc, builder.getIndexType(), ldsAlloc);
+      Value result = ldsBaseOffset.getResult();
+      if (nWf > 1) {
+        Value wavefrontSize = arith::ConstantIndexOp::create(builder, loc, 64);
+        Value threadIdX =
+            gpu::ThreadIdOp::create(builder, loc, gpu::Dimension::x);
+        Value wavefrontId =
+            arith::DivUIOp::create(builder, loc, threadIdX, wavefrontSize);
+        Value tileSizeVal =
+            arith::ConstantIndexOp::create(builder, loc, tileSizeBytes);
+        Value wavefrontOffset =
+            arith::MulIOp::create(builder, loc, wavefrontId, tileSizeVal);
+        result = arith::AddIOp::create(builder, loc, result, wavefrontOffset);
+      }
+      ldsCache[dst] = result;
+      builder.restoreInsertionPoint(savedIP);
+    });
+
+    // Convert air.dma_memcpy_nd directly (Global→LDS only; no channels).
+    // Emit: copy_<dtype>_<MxN>(base_sgpr, stride, row_off, col_off, lds_dst)
+    moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma) {
+      Value dst = dma.getDstMemref();
+      Value src = dma.getSrcMemref();
+      bool dstIsLDS = isPromotedBuffer(dst);
+      if (!dstIsLDS)
+        return; // Only handle Global→LDS DMAs here.
+
+      auto dstTy = cast<MemRefType>(dst.getType());
+      builder.setInsertionPoint(dma);
+      Location loc = dma.getLoc();
+
+      std::string name = buildFuncName("copy", dstTy);
+
+      auto indexTy = builder.getIndexType();
+      auto sx2Ty = amdgcn::SGPRType::get(ctx, Register(), /*size=*/2,
+                                          /*alignment=*/2);
+      SmallVector<Value> callArgs;
+      SmallVector<Type> argTypes;
+
+      // Decompose BASE src memref → (sgpr_base, byte_stride).
+      auto [ptrVal, byteStride] = decomposeGlobalMemref(builder, loc, src);
+      callArgs.push_back(ptrVal);
+      argTypes.push_back(sx2Ty);
+      callArgs.push_back(byteStride);
+      argTypes.push_back(indexTy);
+
+      // Src tile offsets (row, col) from DMA operands.
+      auto srcOffsets = dma.getSrcOffsets();
+      if (srcOffsets.size() >= 2) {
+        callArgs.push_back(srcOffsets[0]);
+        argTypes.push_back(indexTy);
+        callArgs.push_back(srcOffsets[1]);
+        argTypes.push_back(indexTy);
+      } else {
+        Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
+        callArgs.push_back(zero);
+        argTypes.push_back(indexTy);
+        callArgs.push_back(zero);
+        argTypes.push_back(indexTy);
+      }
+
+      // LDS dst offset from cache.
+      assert(ldsCache.count(dst) && "DMA dst LDS not pre-allocated");
+      callArgs.push_back(ldsCache[dst]);
+      argTypes.push_back(indexTy);
+
+      auto funcTy = builder.getFunctionType(argTypes, {});
+      ensureDecl(builder, declBlock, loc, name, funcTy);
+      func::CallOp::create(builder, loc, name, TypeRange{}, callArgs);
+      toErase.push_back(dma);
     });
 
     // Now process linalg ops — they'll hit the ldsCache for shared allocs.

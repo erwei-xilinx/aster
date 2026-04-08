@@ -1,6 +1,5 @@
 add_mlir_library(MlirAirLib
   lib/AirToAMDGCN.cpp
-  lib/ConvertAirChannelToAMDGCN.cpp
   lib/ConvertLinalgToAMDGCN.cpp
   lib/ConvertMemSpaceToAMDGCN.cpp
   lib/Init.cpp
@@ -47,6 +46,12 @@ target_link_libraries(mlir-air-opt PRIVATE
   ASTERInit
   AMDGCNTransforms
   MLIROptLib
+  # Re-list archives whose symbols are referenced by MlirAirLib (Init.cpp,
+  # AirToAMDGCN.cpp) but resolved after the linker's first pass.
+  AIRDialect
+  AIRTransformOps
+  MLIRTensorInferTypeOpInterfaceImpl
+  MLIRBufferizationTransformOps
 )
 mlir_check_all_link_libraries(mlir-air-opt)
 install(TARGETS mlir-air-opt)
