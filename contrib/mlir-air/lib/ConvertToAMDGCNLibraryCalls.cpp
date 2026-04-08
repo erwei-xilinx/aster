@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-//===- ConvertLinalgToAMDGCN.cpp - linalg ops -> AMDGCN library calls -----===//
+//===- ConvertToAMDGCNLibraryCalls.cpp - ops -> AMDGCN library calls ------===//
 
 #include "air/Dialect/AIR/AIRDialect.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNAttrs.h"
@@ -264,13 +264,13 @@ static void replaceWithCall(OpBuilder &builder, Block &declBlock, Operation *op,
   toErase.push_back(op);
 }
 
-struct ConvertLinalgToAMDGCN
-    : public PassWrapper<ConvertLinalgToAMDGCN,
+struct ConvertToAMDGCNLibraryCalls
+    : public PassWrapper<ConvertToAMDGCNLibraryCalls,
                          InterfacePass<aster::ModuleOpInterface>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertLinalgToAMDGCN)
-  StringRef getArgument() const override { return "convert-linalg-to-amdgcn"; }
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertToAMDGCNLibraryCalls)
+  StringRef getArgument() const override { return "convert-to-amdgcn-library-calls"; }
   StringRef getDescription() const override {
-    return "Convert tiled linalg ops to AMDGCN library calls";
+    return "Convert linalg/AIR ops to AMDGCN library calls";
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<ptr::PtrDialect>();
@@ -719,7 +719,7 @@ struct ConvertLinalgToAMDGCN
 } // namespace
 
 namespace mlir::aster::mlir_air {
-std::unique_ptr<Pass> createConvertLinalgToAMDGCN() {
-  return std::make_unique<ConvertLinalgToAMDGCN>();
+std::unique_ptr<Pass> createConvertToAMDGCNLibraryCalls() {
+  return std::make_unique<ConvertToAMDGCNLibraryCalls>();
 }
 } // namespace mlir::aster::mlir_air

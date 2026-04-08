@@ -52,7 +52,7 @@ namespace air_xform_reg {
 namespace mlir::aster::mlir_air {
 
 std::unique_ptr<Pass> createAirToAMDGCN();
-std::unique_ptr<Pass> createConvertLinalgToAMDGCN();
+std::unique_ptr<Pass> createConvertToAMDGCNLibraryCalls();
 std::unique_ptr<Pass> createConvertMemSpaceToAMDGCN();
 void registerPipelines();
 
@@ -109,7 +109,7 @@ void registerAll(DialectRegistry &registry) {
 
   // Aster-specific passes.
   registerPass([] { return createAirToAMDGCN(); });
-  registerPass([] { return createConvertLinalgToAMDGCN(); });
+  registerPass([] { return createConvertToAMDGCNLibraryCalls(); });
   registerPass([] { return createConvertMemSpaceToAMDGCN(); });
 
   // mlir-air pipelines.
