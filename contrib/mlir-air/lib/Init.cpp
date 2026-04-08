@@ -10,6 +10,7 @@
 #include "air/Dialect/AIR/AIRDialect.h"
 #include "air/Dialect/AIR/AIRTransformOps.h"
 #include "air/Transform/AIRDmaToChannel.h"
+#include "air/Transform/AIRMiscPasses.h"
 
 // Tablegen-generated per-pass registration for upstream AIR passes.
 namespace air_conv_reg {
@@ -22,6 +23,7 @@ namespace air_conv_reg {
 
 namespace air_xform_reg {
 #define GEN_PASS_REGISTRATION_DMATOCHANNEL
+#define GEN_PASS_REGISTRATION_AIROVERRIDEMEMREFMEMORYSPACE
 #include "air/Transform/Passes.h.inc"
 } // namespace air_xform_reg
 
@@ -110,6 +112,7 @@ void registerAll(DialectRegistry &registry) {
   air_conv_reg::registerParallelToLaunch(); // air-par-to-launch
   air_conv_reg::registerAIRWrapFuncWithParallelPass(); // air-wrap-func-with-parallel
   air_xform_reg::registerDmaToChannel(); // air-dma-to-channel
+  air_xform_reg::registerAIROverrideMemRefMemorySpace();
 
   // Aster-specific passes.
   registerPass([] { return createAirToAMDGCN(); });

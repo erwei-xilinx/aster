@@ -188,7 +188,8 @@ decomposeGlobalMemref(OpBuilder &builder, Location loc, Value memref) {
 // Patterns
 // ---------------------------------------------------------------------------
 
-/// Convert air.dma_memcpy_nd (Global→LDS) to a library call.
+/// Convert air.dma_memcpy_nd to a library call.
+/// Handles both directions: Global→LDS and LDS→Global.
 struct DmaToLibraryCall
     : public OpRewritePattern<xilinx::air::DmaMemcpyNdOp> {
   ConversionContext &convCtx;
@@ -199,42 +200,69 @@ struct DmaToLibraryCall
   LogicalResult matchAndRewrite(xilinx::air::DmaMemcpyNdOp dma,
                                 PatternRewriter &rewriter) const override {
     Value dst = dma.getDstMemref();
-    if (!isPromotedBuffer(dst))
+    Value src = dma.getSrcMemref();
+    bool dstIsLDS = isPromotedBuffer(dst);
+    bool srcIsLDS = isPromotedBuffer(src);
+    if (!dstIsLDS && !srcIsLDS)
       return failure();
 
-    Value src = dma.getSrcMemref();
-    auto dstTy = cast<MemRefType>(dst.getType());
     Location loc = dma.getLoc();
-    std::string name = buildFuncName("copy", dstTy);
-
     auto indexTy = rewriter.getIndexType();
     auto sx2Ty = amdgcn::SGPRType::get(rewriter.getContext(), Register(),
                                        /*size=*/2, /*alignment=*/2);
     SmallVector<Value> callArgs;
     SmallVector<Type> argTypes;
 
-    auto [ptrVal, byteStride] = decomposeGlobalMemref(rewriter, loc, src);
-    callArgs.push_back(ptrVal);
-    argTypes.push_back(sx2Ty);
-    callArgs.push_back(byteStride);
-    argTypes.push_back(indexTy);
+    // Use the LDS memref type for function naming.
+    // Append direction suffix to distinguish global→LDS from LDS→global.
+    auto ldsTy = cast<MemRefType>(dstIsLDS ? dst.getType() : src.getType());
+    std::string name = buildFuncName(
+        srcIsLDS ? "store_global" : "copy", ldsTy);
 
-    auto srcOffsets = dma.getSrcOffsets();
-    if (srcOffsets.size() >= 2) {
-      callArgs.push_back(srcOffsets[0]);
+    if (dstIsLDS && !srcIsLDS) {
+      // Global→LDS: copy(global_ptr, stride, row, col, lds_dst)
+      auto [ptrVal, byteStride] = decomposeGlobalMemref(rewriter, loc, src);
+      callArgs.push_back(ptrVal);
+      argTypes.push_back(sx2Ty);
+      callArgs.push_back(byteStride);
       argTypes.push_back(indexTy);
-      callArgs.push_back(srcOffsets[1]);
+      auto srcOffsets = dma.getSrcOffsets();
+      if (srcOffsets.size() >= 2) {
+        callArgs.push_back(srcOffsets[0]);
+        callArgs.push_back(srcOffsets[1]);
+      } else {
+        Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+        callArgs.push_back(zero);
+        callArgs.push_back(zero);
+      }
+      argTypes.push_back(indexTy);
+      argTypes.push_back(indexTy);
+      callArgs.push_back(emitLDSOffset(rewriter, loc, dst, convCtx));
+      argTypes.push_back(indexTy);
+    } else if (srcIsLDS && !dstIsLDS) {
+      // LDS→Global: copy(lds_src, global_ptr, stride, row, col)
+      callArgs.push_back(emitLDSOffset(rewriter, loc, src, convCtx));
+      argTypes.push_back(indexTy);
+      auto [ptrVal, byteStride] = decomposeGlobalMemref(rewriter, loc, dst);
+      callArgs.push_back(ptrVal);
+      argTypes.push_back(sx2Ty);
+      callArgs.push_back(byteStride);
+      argTypes.push_back(indexTy);
+      auto dstOffsets = dma.getDstOffsets();
+      if (dstOffsets.size() >= 2) {
+        callArgs.push_back(dstOffsets[0]);
+        callArgs.push_back(dstOffsets[1]);
+      } else {
+        Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+        callArgs.push_back(zero);
+        callArgs.push_back(zero);
+      }
+      argTypes.push_back(indexTy);
       argTypes.push_back(indexTy);
     } else {
-      Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-      callArgs.push_back(zero);
-      argTypes.push_back(indexTy);
-      callArgs.push_back(zero);
-      argTypes.push_back(indexTy);
+      // LDS→LDS: not supported.
+      return failure();
     }
-
-    callArgs.push_back(emitLDSOffset(rewriter, loc, dst, convCtx));
-    argTypes.push_back(indexTy);
 
     auto funcTy = rewriter.getFunctionType(argTypes, {});
     ensureDecl(rewriter, *convCtx.declBlock, loc, name, funcTy);
@@ -346,9 +374,16 @@ struct GenericMatmulToLibraryCall : public OpRewritePattern<linalg::GenericOp> {
     if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 ||
         op.getNumReductionLoops() != 1)
       return failure();
-    // Delegate to the generic linalg pattern.
+    // Use _lds_c suffix when the output operand is in LDS.
+    StringRef prefix = "mfma_matmul";
+    bool outputIsLDS = false;
+    for (Value out : op.getDpsInits())
+      if (isPromotedBuffer(out))
+        outputIsLDS = true;
+    std::string prefixStr =
+        outputIsLDS ? "mfma_matmul_lds_c" : "mfma_matmul";
     LinalgToLibraryCall<linalg::GenericOp> inner(
-        rewriter.getContext(), convCtx, "mfma_matmul");
+        rewriter.getContext(), convCtx, prefixStr);
     return inner.matchAndRewrite(op, rewriter);
   }
 };

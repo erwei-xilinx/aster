@@ -143,30 +143,55 @@ class TestAirMatmulE2E:
         np.testing.assert_allclose(C, expected, rtol=1e-2, atol=1e-2)
 
     def test_matmul_padded_40x40(self):
-        """Matmul with non-tile-aligned dimensions: actual 40x40, padded to 48x48."""
-        M_actual, N_actual, K = 40, 40, 64
-        M_pad, N_pad = 48, 48  # next multiple of 16
+        """Matmul with non-tile-aligned dimensions: actual 40x40x64.
+
+        Kernel operates on actual dimensions (memref<40x64xf16>, memref<40x40xf32>).
+        Transform pads boundary tiles to 16. Host over-allocates C to 48*48
+        to accommodate OOB stores from boundary tiles.
+        """
+        M, N, K = 40, 40, 64
+        M_pad = 48  # next multiple of 16, for C over-allocation
 
         np.random.seed(42)
-        A_actual = (np.random.randn(M_actual, K) * 0.1).astype(np.float16)
-        B_actual = (np.random.randn(N_actual, K) * 0.1).astype(np.float16)
+        A = (np.random.randn(M, K) * 0.1).astype(np.float16)
+        B_T = (np.random.randn(N, K) * 0.1).astype(np.float16)
 
-        # Pad A and B to tile-aligned sizes (zero-fill padding region).
-        A_padded = np.zeros((M_pad, K), dtype=np.float16)
-        A_padded[:M_actual, :] = A_actual
-        B_padded = np.zeros((N_pad, K), dtype=np.float16)
-        B_padded[:N_actual, :] = B_actual
-
-        C = np.zeros(M_pad * N_pad, dtype=np.float32)
+        # Over-allocate C: kernel writes full 16x16 tiles at boundaries,
+        # going beyond 40x40. Allocate 48*48 elements but pass as 40x40 memref.
+        C = np.zeros(M_pad * M_pad, dtype=np.float32)
 
         def padded_preprocess(mlir_text):
-            return _air_preprocess_with_files(
-                mlir_text, _PADDED_TRANSFORM_FILE)
+            opt = _find_mlir_air_opt()
+            result = subprocess.run(
+                [
+                    opt,
+                    f"--transform-preload-library=transform-library-paths={_PADDED_TRANSFORM_FILE}",
+                    "--transform-interpreter",
+                    "--canonicalize", "--cse",
+                    # Set memory_space=2 on padding allocs (no memory space → L1).
+                    "--air-override-memref-memory-space=scope=func memory-space=2",
+                    "--air-par-to-herd",
+                    "--canonicalize", "--cse",
+                    "--air-par-to-launch=has-air-segment=true",
+                    "--canonicalize", "--cse",
+                    "--air-copy-to-dma",
+                    "--air-to-amdgcn",
+                    "--canonicalize",
+                    "--convert-memspace-to-amdgcn",
+                    "--convert-to-amdgcn-library-calls",
+                ],
+                input=mlir_text,
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"mlir-air-opt padded preprocessing failed:\n{result.stderr}")
+            return result.stdout
 
         compile_and_run(
             file_name=_PADDED_MLIR_FILE,
-            kernel_name="matmul_f16_48x48",
-            input_data=[A_padded.flatten(), B_padded.flatten()],
+            kernel_name="matmul_f16_40x40",
+            input_data=[A.flatten(), B_T.flatten()],
             output_data=[C],
             pass_pipeline=_post_air_pipeline(_LIBRARY_PATHS),
             library_paths=[],
@@ -175,8 +200,8 @@ class TestAirMatmulE2E:
             preprocess=padded_preprocess,
         )
 
-        # Extract valid 40x40 region and compare.
-        C_2d = C.reshape(M_pad, N_pad)
-        C_valid = C_2d[:M_actual, :N_actual].flatten()
-        expected = (A_actual.astype(np.float32) @ B_actual.T.astype(np.float32)).flatten()
-        np.testing.assert_allclose(C_valid, expected, rtol=1e-2, atol=1e-2)
+        # Extract valid 40x40 region (C is over-allocated as flat 48*48).
+        # The kernel writes with stride=40, so reinterpret accordingly.
+        C_2d = C[:M * M_pad].reshape(-1, M_pad)[:M, :N].flatten()
+        expected = (A.astype(np.float32) @ B_T.T.astype(np.float32)).flatten()
+        np.testing.assert_allclose(C_2d, expected, rtol=1e-2, atol=1e-2)
