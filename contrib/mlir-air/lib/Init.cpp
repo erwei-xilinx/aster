@@ -60,7 +60,6 @@ namespace mlir::aster::mlir_air {
 std::unique_ptr<Pass> createAirToAMDGCN();
 std::unique_ptr<Pass> createConvertToAMDGCNLibraryCalls();
 std::unique_ptr<Pass> createConvertMemSpaceToAMDGCN();
-std::unique_ptr<Pass> createPromoteAllocsToFuncArgs();
 void registerPipelines();
 
 void registerAll(DialectRegistry &registry) {
@@ -123,7 +122,6 @@ void registerAll(DialectRegistry &registry) {
   registerPass([] { return createAirToAMDGCN(); });
   registerPass([] { return createConvertToAMDGCNLibraryCalls(); });
   registerPass([] { return createConvertMemSpaceToAMDGCN(); });
-  registerPass([] { return createPromoteAllocsToFuncArgs(); });
 
   // mlir-air pipelines.
   registerPipelines();
