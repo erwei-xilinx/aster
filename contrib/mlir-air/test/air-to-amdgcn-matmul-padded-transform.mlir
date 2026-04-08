@@ -1,3 +1,9 @@
+// Copyright 2026 The ASTER Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 // Transform sequence for padded matmul with device-side padding.
 // A/B are 40x64 (actual), NOT padded. C is 48x48 (padded for safe stores).
 //
