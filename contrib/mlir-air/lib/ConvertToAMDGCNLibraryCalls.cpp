@@ -9,7 +9,6 @@
 #include "air/Dialect/AIR/AIRDialect.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNAttrs.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNDialect.h"
-#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNEnums.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNOps.h"
 #include "aster/Dialect/AMDGCN/IR/AMDGCNTypes.h"
@@ -19,6 +18,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrDialect.h"
@@ -26,13 +26,19 @@
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
 using namespace mlir::aster;
 using namespace mlir::aster::amdgcn;
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 static std::string buildFuncName(StringRef prefix, MemRefType ty) {
   std::string name;
@@ -66,27 +72,17 @@ static void ensureDecl(OpBuilder &builder, Block &block, Location loc,
   builder.restoreInsertionPoint(savedIP);
 }
 
-/// Check if a memref value comes from promote to shared memory.
-/// Matches two patterns:
-///   1. memref.view(memref.alloca) with non-default memory space (from promote)
-///   2. memref.alloc with non-default memory space (from bufferize_to_allocation)
 static bool isPromotedBuffer(Value v) {
-  // Pattern 1: memref.view(memref.alloca) — from transform.structured.promote.
   if (auto viewOp = v.getDefiningOp<memref::ViewOp>()) {
-    if (auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>()) {
+    if (auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>())
       return allocaOp.getMemref().getType().getMemorySpace() != nullptr;
-    }
   }
-  // Pattern 2: memref.alloc with L1/local memory space —
-  // from bufferize_to_allocation.
   if (auto allocOp = v.getDefiningOp<memref::AllocOp>()) {
     auto memSpace = allocOp.getMemref().getType().getMemorySpace();
     if (!memSpace)
       return false;
-    // Integer memory space 2 = L1 (AIR convention).
     if (auto intAttr = dyn_cast<IntegerAttr>(memSpace))
       return intAttr.getInt() == 2;
-    // #amdgcn.addr_space<local> = LDS.
     if (auto addrSpace = dyn_cast<amdgcn::AddressSpaceAttr>(memSpace))
       return addrSpace.getSpace() == amdgcn::AddressSpaceKind::Local;
     return false;
@@ -94,181 +90,355 @@ static bool isPromotedBuffer(Value v) {
   return false;
 }
 
-/// Emit amdgcn.alloc_lds + get_lds_offset for a promoted buffer.
-/// Uses a cache so the same promoted buffer gets the same LDS region
-/// for both write (copy) and read (matmul).
+// ---------------------------------------------------------------------------
+// Shared context for patterns (populated by analysis, read by patterns).
+// ---------------------------------------------------------------------------
+
+struct ConversionContext {
+  Block *declBlock = nullptr;
+  int64_t numWavefronts = 1;
+  DenseMap<Value, Value> ldsCache;
+};
+
+/// Emit amdgcn.alloc_lds + get_lds_offset for a promoted buffer at function
+/// entry.  When numWavefronts > 1, allocates nWf * tileSizeBytes and adds a
+/// per-wavefront offset (wavefrontId * tileSizeBytes).
+/// Uses ldsCache so the same buffer gets the same LDS region regardless of
+/// which pattern fires first.
 static Value emitLDSOffset(OpBuilder &builder, Location loc, Value memrefVal,
-                           DenseMap<Value, Value> &ldsCache) {
-  auto it = ldsCache.find(memrefVal);
-  if (it != ldsCache.end())
+                           ConversionContext &convCtx) {
+  auto it = convCtx.ldsCache.find(memrefVal);
+  if (it != convCtx.ldsCache.end())
     return it->second;
 
   int64_t sizeBytes = 0;
   Value byteShift;
-
-  // Pattern 1: memref.view(memref.alloca) — from promote.
   if (auto viewOp = memrefVal.getDefiningOp<memref::ViewOp>()) {
     auto allocaOp = viewOp.getSource().getDefiningOp<memref::AllocaOp>();
     sizeBytes = allocaOp.getMemref().getType().getNumElements();
     byteShift = viewOp.getByteShift();
-  }
-  // Pattern 2: memref.alloc — from bufferize_to_allocation.
-  else if (auto allocOp = memrefVal.getDefiningOp<memref::AllocOp>()) {
+  } else if (auto allocOp = memrefVal.getDefiningOp<memref::AllocOp>()) {
     auto mrTy = allocOp.getMemref().getType();
     unsigned eltBits = mrTy.getElementType().getIntOrFloatBitWidth();
     sizeBytes = mrTy.getNumElements() * eltBits / 8;
   }
 
+  // Insert at function entry so LDS allocation dominates all uses.
+  auto funcOp = memrefVal.getParentRegion()->getParentOfType<func::FuncOp>();
+  auto savedIP = builder.saveInsertionPoint();
+  if (funcOp)
+    builder.setInsertionPointToStart(&funcOp.front());
+
+  int64_t nWf = convCtx.numWavefronts;
   auto ldsAlloc = AllocLDSOp::create(builder, loc, /*dynamic_size=*/Value(),
-                                     sizeBytes, /*alignment=*/16,
+                                     nWf * sizeBytes, /*alignment=*/16,
                                      /*offset=*/IntegerAttr{});
   auto ldsOffset =
       GetLDSOffsetOp::create(builder, loc, builder.getIndexType(), ldsAlloc);
-
   Value result = ldsOffset.getResult();
+
+  if (nWf > 1) {
+    Value wavefrontSize = arith::ConstantIndexOp::create(builder, loc, 64);
+    Value threadIdX =
+        gpu::ThreadIdOp::create(builder, loc, gpu::Dimension::x);
+    Value wavefrontId =
+        arith::DivUIOp::create(builder, loc, threadIdX, wavefrontSize);
+    Value tileSizeVal =
+        arith::ConstantIndexOp::create(builder, loc, sizeBytes);
+    Value wavefrontOffset =
+        arith::MulIOp::create(builder, loc, wavefrontId, tileSizeVal);
+    result = arith::AddIOp::create(builder, loc, result, wavefrontOffset);
+  }
+
   if (byteShift)
     result = builder.create<arith::AddIOp>(loc, result, byteShift);
 
-  ldsCache[memrefVal] = result;
+  builder.restoreInsertionPoint(savedIP);
+  convCtx.ldsCache[memrefVal] = result;
   return result;
 }
 
-/// Decompose a global memref into (!sx2, byte_stride: index).
-/// Emits: extract_strided_metadata -> ptr.to_ptr -> lsir.to_reg -> ptr_add.
 static std::pair<Value, Value>
 decomposeGlobalMemref(OpBuilder &builder, Location loc, Value memref) {
   auto mrTy = cast<MemRefType>(memref.getType());
   unsigned eltBytes = mrTy.getElementType().getIntOrFloatBitWidth() / 8;
-
-  // extract_strided_metadata -> (base_memref, offset, sizes..., strides...)
   auto metadata =
       memref::ExtractStridedMetadataOp::create(builder, loc, memref);
   Value baseBuffer = metadata.getBaseBuffer();
   Value offset = metadata.getOffset();
-  // Leading stride is strides[0] (row stride in elements).
   Value leadingStride = metadata.getStrides()[0];
-
-  // byte_stride = leading_stride * elt_bytes
   Value eltSize = arith::ConstantIndexOp::create(builder, loc, eltBytes);
   Value byteStride =
       arith::MulIOp::create(builder, loc, leadingStride, eltSize);
-
-  // byte_offset = offset * elt_bytes
   Value byteOffset = arith::MulIOp::create(builder, loc, offset, eltSize);
-
-  // ptr.to_ptr base_memref -> !ptr.ptr<addr_space>
   auto addrSpace = cast<ptr::MemorySpaceAttrInterface>(mrTy.getMemorySpace());
   auto ptrTy = ptr::PtrType::get(builder.getContext(), addrSpace);
   Value ptrVal = ptr::ToPtrOp::create(builder, loc, ptrTy, baseBuffer);
-
-  // lsir.to_reg ptr -> !sx2
   auto sx2Ty = amdgcn::SGPRType::get(builder.getContext(), Register(),
                                      /*size=*/2, /*alignment=*/2);
   Value rawPtr = lsir::ToRegOp::create(builder, loc, sx2Ty, ptrVal);
-
-  // Add byte offset: from_reg -> ptr_add -> to_reg
   Value ptrFromReg = lsir::FromRegOp::create(builder, loc, ptrTy, rawPtr);
   Value adjusted =
       ptr::PtrAddOp::create(builder, loc, ptrTy, ptrFromReg, byteOffset);
   Value result = lsir::ToRegOp::create(builder, loc, sx2Ty, adjusted);
-
   return {result, byteStride};
 }
 
-/// Replace a linalg op with a library call.
-/// Global memrefs -> decomposed (!sx2, byte_stride) args.
-/// Promoted buffers -> index (LDS offset).
-static void replaceWithCall(OpBuilder &builder, Block &declBlock, Operation *op,
-                            StringRef namePrefix,
-                            SmallVector<Operation *> &toErase,
-                            DenseMap<Value, Value> &ldsCache) {
-  // Only convert ops that involve at least one promoted (LDS) buffer.
-  bool hasPromotedOperand = false;
-  for (Value operand : op->getOperands())
-    if (isPromotedBuffer(operand))
-      hasPromotedOperand = true;
-  if (!hasPromotedOperand)
-    return;
+// ---------------------------------------------------------------------------
+// Patterns
+// ---------------------------------------------------------------------------
 
-  auto indexTy = builder.getIndexType();
-  SmallVector<Value> callArgs;
-  SmallVector<Type> argTypes;
+/// Convert air.dma_memcpy_nd (Global→LDS) to a library call.
+struct DmaToLibraryCall
+    : public OpRewritePattern<xilinx::air::DmaMemcpyNdOp> {
+  ConversionContext &convCtx;
 
-  MemRefType namingType;
-  for (Value operand : op->getOperands())
-    if (auto mrTy = dyn_cast<MemRefType>(operand.getType()))
-      if (!namingType)
-        namingType = mrTy;
-  if (!namingType)
-    return;
-  std::string name = buildFuncName(namePrefix, namingType);
+  DmaToLibraryCall(MLIRContext *ctx, ConversionContext &convCtx)
+      : OpRewritePattern(ctx), convCtx(convCtx) {}
 
-  builder.setInsertionPoint(op);
-  Location loc = op->getLoc();
+  LogicalResult matchAndRewrite(xilinx::air::DmaMemcpyNdOp dma,
+                                PatternRewriter &rewriter) const override {
+    Value dst = dma.getDstMemref();
+    if (!isPromotedBuffer(dst))
+      return failure();
 
-  auto sx2Ty = amdgcn::SGPRType::get(builder.getContext(), Register(),
-                                     /*size=*/2, /*alignment=*/2);
+    Value src = dma.getSrcMemref();
+    auto dstTy = cast<MemRefType>(dst.getType());
+    Location loc = dma.getLoc();
+    std::string name = buildFuncName("copy", dstTy);
 
-  for (Value operand : op->getOperands()) {
-    if (auto mrTy = dyn_cast<MemRefType>(operand.getType())) {
-      if (isPromotedBuffer(operand)) {
-        callArgs.push_back(emitLDSOffset(builder, loc, operand, ldsCache));
-        argTypes.push_back(indexTy);
-      } else {
-        // Global memref: if this is a subview, decompose the BASE memref
-        // (clean sgpr) and pass tile offsets separately. This avoids
-        // baking wavefront-varying offsets into the pointer.
-        Value baseMemref = operand;
-        SmallVector<Value> tileOffsets;
-        if (auto svOp = operand.getDefiningOp<memref::SubViewOp>()) {
-          baseMemref = svOp.getSource();
-          for (auto off : svOp.getMixedOffsets()) {
-            if (auto val = dyn_cast<Value>(off))
-              tileOffsets.push_back(val);
-            else
-              tileOffsets.push_back(arith::ConstantIndexOp::create(
-                  builder, loc,
-                  cast<IntegerAttr>(off.get<Attribute>()).getInt()));
+    auto indexTy = rewriter.getIndexType();
+    auto sx2Ty = amdgcn::SGPRType::get(rewriter.getContext(), Register(),
+                                       /*size=*/2, /*alignment=*/2);
+    SmallVector<Value> callArgs;
+    SmallVector<Type> argTypes;
+
+    auto [ptrVal, byteStride] = decomposeGlobalMemref(rewriter, loc, src);
+    callArgs.push_back(ptrVal);
+    argTypes.push_back(sx2Ty);
+    callArgs.push_back(byteStride);
+    argTypes.push_back(indexTy);
+
+    auto srcOffsets = dma.getSrcOffsets();
+    if (srcOffsets.size() >= 2) {
+      callArgs.push_back(srcOffsets[0]);
+      argTypes.push_back(indexTy);
+      callArgs.push_back(srcOffsets[1]);
+      argTypes.push_back(indexTy);
+    } else {
+      Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+      callArgs.push_back(zero);
+      argTypes.push_back(indexTy);
+      callArgs.push_back(zero);
+      argTypes.push_back(indexTy);
+    }
+
+    callArgs.push_back(emitLDSOffset(rewriter, loc, dst, convCtx));
+    argTypes.push_back(indexTy);
+
+    auto funcTy = rewriter.getFunctionType(argTypes, {});
+    ensureDecl(rewriter, *convCtx.declBlock, loc, name, funcTy);
+    func::CallOp::create(rewriter, loc, name, TypeRange{}, callArgs);
+    rewriter.eraseOp(dma);
+    return success();
+  }
+};
+
+/// Convert a linalg op (or memref.copy) with at least one promoted (LDS)
+/// operand to a library call.
+template <typename OpTy>
+struct LinalgToLibraryCall : public OpRewritePattern<OpTy> {
+  ConversionContext &convCtx;
+  StringRef namePrefix;
+
+  LinalgToLibraryCall(MLIRContext *ctx, ConversionContext &convCtx,
+                      StringRef namePrefix)
+      : OpRewritePattern<OpTy>(ctx), convCtx(convCtx),
+        namePrefix(namePrefix) {}
+
+  LogicalResult matchAndRewrite(OpTy op,
+                                PatternRewriter &rewriter) const override {
+    bool hasPromoted = false;
+    for (Value operand : op->getOperands())
+      if (isPromotedBuffer(operand))
+        hasPromoted = true;
+    if (!hasPromoted)
+      return failure();
+
+    MemRefType namingType;
+    for (Value operand : op->getOperands())
+      if (auto mrTy = dyn_cast<MemRefType>(operand.getType()))
+        if (!namingType)
+          namingType = mrTy;
+    if (!namingType)
+      return failure();
+
+    std::string name = buildFuncName(namePrefix, namingType);
+    Location loc = op->getLoc();
+    auto indexTy = rewriter.getIndexType();
+    auto sx2Ty = amdgcn::SGPRType::get(rewriter.getContext(), Register(),
+                                       /*size=*/2, /*alignment=*/2);
+    SmallVector<Value> callArgs;
+    SmallVector<Type> argTypes;
+
+    for (Value operand : op->getOperands()) {
+      if (auto mrTy = dyn_cast<MemRefType>(operand.getType())) {
+        if (isPromotedBuffer(operand)) {
+          callArgs.push_back(
+              emitLDSOffset(rewriter, loc, operand, convCtx));
+          argTypes.push_back(indexTy);
+        } else {
+          Value baseMemref = operand;
+          SmallVector<Value> tileOffsets;
+          if (auto svOp = operand.getDefiningOp<memref::SubViewOp>()) {
+            baseMemref = svOp.getSource();
+            for (auto off : svOp.getMixedOffsets()) {
+              if (auto val = dyn_cast<Value>(off))
+                tileOffsets.push_back(val);
+              else
+                tileOffsets.push_back(arith::ConstantIndexOp::create(
+                    rewriter, loc,
+                    cast<IntegerAttr>(off.get<Attribute>()).getInt()));
+            }
+          }
+          auto [ptrVal, byteStride] =
+              decomposeGlobalMemref(rewriter, loc, baseMemref);
+          callArgs.push_back(ptrVal);
+          argTypes.push_back(sx2Ty);
+          callArgs.push_back(byteStride);
+          argTypes.push_back(indexTy);
+          if (tileOffsets.empty()) {
+            for (int64_t i = 0; i < mrTy.getRank(); ++i) {
+              callArgs.push_back(
+                  arith::ConstantIndexOp::create(rewriter, loc, 0));
+              argTypes.push_back(indexTy);
+            }
+          } else {
+            for (auto off : tileOffsets) {
+              callArgs.push_back(off);
+              argTypes.push_back(indexTy);
+            }
           }
         }
-        auto [ptrVal, byteStride] =
-            decomposeGlobalMemref(builder, loc, baseMemref);
-        callArgs.push_back(ptrVal);
-        argTypes.push_back(sx2Ty);
-        callArgs.push_back(byteStride);
-        argTypes.push_back(indexTy);
-        // Pass tile offsets (or zeros if no subview).
-        if (tileOffsets.empty()) {
-          auto rank = mrTy.getRank();
-          for (int64_t i = 0; i < rank; ++i) {
-            callArgs.push_back(
-                arith::ConstantIndexOp::create(builder, loc, 0));
-            argTypes.push_back(indexTy);
-          }
-        } else {
-          for (auto off : tileOffsets) {
-            callArgs.push_back(off);
-            argTypes.push_back(indexTy);
-          }
+      } else {
+        callArgs.push_back(operand);
+        argTypes.push_back(operand.getType());
+      }
+    }
+
+    auto funcTy = rewriter.getFunctionType(argTypes, {});
+    ensureDecl(rewriter, *convCtx.declBlock, loc, name, funcTy);
+    func::CallOp::create(rewriter, loc, name, TypeRange{}, callArgs);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Match linalg.generic with matmul semantics (2 inputs, 1 output, 1 reduction).
+struct GenericMatmulToLibraryCall : public OpRewritePattern<linalg::GenericOp> {
+  ConversionContext &convCtx;
+
+  GenericMatmulToLibraryCall(MLIRContext *ctx, ConversionContext &convCtx)
+      : OpRewritePattern(ctx), convCtx(convCtx) {}
+
+  LogicalResult matchAndRewrite(linalg::GenericOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 ||
+        op.getNumReductionLoops() != 1)
+      return failure();
+    // Delegate to the generic linalg pattern.
+    LinalgToLibraryCall<linalg::GenericOp> inner(
+        rewriter.getContext(), convCtx, "mfma_matmul");
+    return inner.matchAndRewrite(op, rewriter);
+  }
+};
+
+/// Erase linalg.fill on global (non-LDS) buffers.
+/// The library's zero_C handles accumulator init.
+struct EraseGlobalFill : public OpRewritePattern<linalg::FillOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::FillOp fill,
+                                PatternRewriter &rewriter) const override {
+    for (Value out : fill.getDpsInits())
+      if (isa<MemRefType>(out.getType()) && !isPromotedBuffer(out)) {
+        rewriter.eraseOp(fill);
+        return success();
+      }
+    return failure();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Analysis: detect numWavefronts from IR and pre-allocate LDS.
+// ---------------------------------------------------------------------------
+
+static int64_t detectNumWavefronts(Operation *moduleOp) {
+  int64_t result = 1;
+  moduleOp->walk([&](arith::DivUIOp divOp) {
+    if (result > 1)
+      return;
+    auto threadId = divOp.getLhs().getDefiningOp<gpu::ThreadIdOp>();
+    if (!threadId || threadId.getDimension() != gpu::Dimension::x)
+      return;
+    auto cst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
+    if (!cst || cst.value() != 64)
+      return;
+    for (Operation *user : divOp.getResult().getUsers()) {
+      auto applyOp = dyn_cast<affine::AffineApplyOp>(user);
+      if (!applyOp || applyOp.getAffineMap().getNumResults() != 1)
+        continue;
+      unsigned wfPos = 0;
+      bool found = false;
+      for (auto [idx, operand] : llvm::enumerate(applyOp.getMapOperands())) {
+        if (operand == divOp.getResult()) {
+          wfPos = idx;
+          found = true;
+          break;
         }
       }
-    } else {
-      callArgs.push_back(operand);
-      argTypes.push_back(operand.getType());
+      if (!found)
+        continue;
+      int64_t stride = 0;
+      AffineExpr expr = applyOp.getAffineMap().getResult(0);
+      expr.walk([&](AffineExpr e) {
+        auto mul = dyn_cast<AffineBinaryOpExpr>(e);
+        if (!mul || mul.getKind() != AffineExprKind::Mul)
+          return;
+        auto sym = dyn_cast<AffineSymbolExpr>(mul.getLHS());
+        auto con = dyn_cast<AffineConstantExpr>(mul.getRHS());
+        if (!sym || !con)
+          return;
+        if (sym.getPosition() == wfPos)
+          stride = con.getValue();
+      });
+      if (stride <= 0)
+        continue;
+      moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma2) {
+        if (result > 1)
+          return;
+        Value src = dma2.getSrcMemref();
+        auto srcTy = dyn_cast<MemRefType>(src.getType());
+        if (!srcTy || srcTy.getRank() < 1 || srcTy.getDimSize(0) <= 0)
+          return;
+        result = srcTy.getDimSize(0) / stride;
+      });
     }
-  }
-
-  auto funcTy = builder.getFunctionType(argTypes, {});
-  ensureDecl(builder, declBlock, loc, name, funcTy);
-  func::CallOp::create(builder, loc, name, TypeRange{}, callArgs);
-  toErase.push_back(op);
+  });
+  return result;
 }
+
+// ---------------------------------------------------------------------------
+// Pass
+// ---------------------------------------------------------------------------
 
 struct ConvertToAMDGCNLibraryCalls
     : public PassWrapper<ConvertToAMDGCNLibraryCalls,
                          InterfacePass<aster::ModuleOpInterface>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertToAMDGCNLibraryCalls)
-  StringRef getArgument() const override { return "convert-to-amdgcn-library-calls"; }
+  StringRef getArgument() const override {
+    return "convert-to-amdgcn-library-calls";
+  }
   StringRef getDescription() const override {
     return "Convert linalg/AIR ops to AMDGCN library calls";
   }
@@ -278,217 +448,32 @@ struct ConvertToAMDGCNLibraryCalls
     registry.insert<amdgcn::AMDGCNDialect>();
   }
 
-
   void runOnOperation() override {
     Operation *moduleOp = getOperation();
     MLIRContext *ctx = &getContext();
 
+    // Find the declaration block (inside amdgcn.module if present).
     Operation *declParent = moduleOp;
     if (isa<mlir::ModuleOp>(moduleOp))
       moduleOp->walk([&](amdgcn::ModuleOp m) { declParent = m; });
-    auto &declBlock = declParent->getRegion(0).front();
-    OpBuilder builder(ctx);
-    SmallVector<Operation *> toErase;
-    DenseMap<Value, Value> ldsCache;
 
-    // Detect numWavefronts from the IR.
-    // air-to-amdgcn emits: wavefrontId = gpu.thread_id x / 64
-    // The affine.apply for M row uses: #map()[%loop_var, %wavefrontId]
-    //   = loop_var + wavefrontId * herdTileM
-    // numWavefronts = totalM / herdTileM.
-    // We find herdTileM from the coefficient of the wavefrontId symbol in the
-    // affine map by scanning AffineApplyOp users of the divui result.
-    int64_t detectedNumWavefronts = 1;
-    moduleOp->walk([&](arith::DivUIOp divOp) {
-      if (detectedNumWavefronts > 1)
-        return;
-      auto threadId = divOp.getLhs().getDefiningOp<gpu::ThreadIdOp>();
-      if (!threadId || threadId.getDimension() != gpu::Dimension::x)
-        return;
-      auto cst = divOp.getRhs().getDefiningOp<arith::ConstantIndexOp>();
-      if (!cst || cst.value() != 64)
-        return;
-      // wavefrontId = divOp.getResult(). Find its use in affine.apply.
-      for (Operation *user : divOp.getResult().getUsers()) {
-        auto applyOp = dyn_cast<affine::AffineApplyOp>(user);
-        if (!applyOp || applyOp.getAffineMap().getNumResults() != 1)
-          continue;
-        // Find the position of wavefrontId in the operand list.
-        unsigned wfPos = 0;
-        bool found = false;
-        for (auto [idx, operand] : llvm::enumerate(applyOp.getMapOperands())) {
-          if (operand == divOp.getResult()) {
-            wfPos = idx;
-            found = true;
-            break;
-          }
-        }
-        if (!found)
-          continue;
-        // Extract coefficient of symbol/dim at wfPos in the affine map.
-        AffineMap map = applyOp.getAffineMap();
-        // The map operands are pure symbols in this context.
-        int64_t stride = 0;
-        AffineExpr expr = map.getResult(0);
-        expr.walk([&](AffineExpr e) {
-          auto mul = dyn_cast<AffineBinaryOpExpr>(e);
-          if (!mul || mul.getKind() != AffineExprKind::Mul)
-            return;
-          auto sym = dyn_cast<AffineSymbolExpr>(mul.getLHS());
-          auto con = dyn_cast<AffineConstantExpr>(mul.getRHS());
-          if (!sym || !con)
-            return;
-          if (sym.getPosition() == wfPos)
-            stride = con.getValue();
-        });
-        if (stride <= 0)
-          continue;
-        // Get totalM from DMA src memref.
-        moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma2) {
-          if (detectedNumWavefronts > 1)
-            return;
-          Value src = dma2.getSrcMemref();
-          auto srcTy = dyn_cast<MemRefType>(src.getType());
-          if (!srcTy || srcTy.getRank() < 1 || srcTy.getDimSize(0) <= 0)
-            return;
-          detectedNumWavefronts = srcTy.getDimSize(0) / stride;
-        });
-      }
-    });
+    ConversionContext convCtx;
+    convCtx.declBlock = &declParent->getRegion(0).front();
+    convCtx.numWavefronts = detectNumWavefronts(moduleOp);
 
-    // Pre-allocate LDS for air.dma_memcpy_nd destinations (no-channel path).
-    // Must run before linalg op processing so matmul hits the same ldsCache.
-    // Allocate numWavefronts * tileSizeBytes and stripe by wavefront_id.
-    moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma) {
-      Value dst = dma.getDstMemref();
-      if (!isPromotedBuffer(dst) || ldsCache.count(dst))
-        return;
-      auto funcOp = dma->getParentOfType<func::FuncOp>();
-      if (!funcOp || funcOp.empty())
-        return;
-      auto savedIP = builder.saveInsertionPoint();
-      builder.setInsertionPointToStart(&funcOp.front());
-      Location loc = funcOp.getLoc();
+    // Apply conversion patterns.
+    RewritePatternSet patterns(ctx);
+    patterns.add<DmaToLibraryCall>(ctx, convCtx);
+    patterns.add<LinalgToLibraryCall<linalg::FillOp>>(ctx, convCtx, "fill");
+    patterns.add<LinalgToLibraryCall<linalg::CopyOp>>(ctx, convCtx, "copy");
+    patterns.add<LinalgToLibraryCall<memref::CopyOp>>(ctx, convCtx, "copy");
+    patterns.add<LinalgToLibraryCall<linalg::MatmulOp>>(ctx, convCtx,
+                                                        "mfma_matmul");
+    patterns.add<GenericMatmulToLibraryCall>(ctx, convCtx);
+    patterns.add<EraseGlobalFill>(ctx);
 
-      int64_t tileSizeBytes = 0;
-      if (auto allocOp = dst.getDefiningOp<memref::AllocOp>()) {
-        auto mrTy = allocOp.getMemref().getType();
-        unsigned eltBits = mrTy.getElementType().getIntOrFloatBitWidth();
-        tileSizeBytes = mrTy.getNumElements() * eltBits / 8;
-      }
-      int64_t nWf = detectedNumWavefronts;
-      auto ldsAlloc = AllocLDSOp::create(builder, loc, /*dynamic_size=*/Value(),
-                                         nWf * tileSizeBytes, /*alignment=*/16,
-                                         /*offset=*/IntegerAttr{});
-      auto ldsBaseOffset =
-          GetLDSOffsetOp::create(builder, loc, builder.getIndexType(), ldsAlloc);
-      Value result = ldsBaseOffset.getResult();
-      if (nWf > 1) {
-        Value wavefrontSize = arith::ConstantIndexOp::create(builder, loc, 64);
-        Value threadIdX =
-            gpu::ThreadIdOp::create(builder, loc, gpu::Dimension::x);
-        Value wavefrontId =
-            arith::DivUIOp::create(builder, loc, threadIdX, wavefrontSize);
-        Value tileSizeVal =
-            arith::ConstantIndexOp::create(builder, loc, tileSizeBytes);
-        Value wavefrontOffset =
-            arith::MulIOp::create(builder, loc, wavefrontId, tileSizeVal);
-        result = arith::AddIOp::create(builder, loc, result, wavefrontOffset);
-      }
-      ldsCache[dst] = result;
-      builder.restoreInsertionPoint(savedIP);
-    });
-
-    // Convert air.dma_memcpy_nd directly (Global→LDS only; no channels).
-    // Emit: copy_<dtype>_<MxN>(base_sgpr, stride, row_off, col_off, lds_dst)
-    moduleOp->walk([&](xilinx::air::DmaMemcpyNdOp dma) {
-      Value dst = dma.getDstMemref();
-      Value src = dma.getSrcMemref();
-      bool dstIsLDS = isPromotedBuffer(dst);
-      if (!dstIsLDS)
-        return; // Only handle Global→LDS DMAs here.
-
-      auto dstTy = cast<MemRefType>(dst.getType());
-      builder.setInsertionPoint(dma);
-      Location loc = dma.getLoc();
-
-      std::string name = buildFuncName("copy", dstTy);
-
-      auto indexTy = builder.getIndexType();
-      auto sx2Ty = amdgcn::SGPRType::get(ctx, Register(), /*size=*/2,
-                                          /*alignment=*/2);
-      SmallVector<Value> callArgs;
-      SmallVector<Type> argTypes;
-
-      // Decompose BASE src memref → (sgpr_base, byte_stride).
-      auto [ptrVal, byteStride] = decomposeGlobalMemref(builder, loc, src);
-      callArgs.push_back(ptrVal);
-      argTypes.push_back(sx2Ty);
-      callArgs.push_back(byteStride);
-      argTypes.push_back(indexTy);
-
-      // Src tile offsets (row, col) from DMA operands.
-      auto srcOffsets = dma.getSrcOffsets();
-      if (srcOffsets.size() >= 2) {
-        callArgs.push_back(srcOffsets[0]);
-        argTypes.push_back(indexTy);
-        callArgs.push_back(srcOffsets[1]);
-        argTypes.push_back(indexTy);
-      } else {
-        Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
-        callArgs.push_back(zero);
-        argTypes.push_back(indexTy);
-        callArgs.push_back(zero);
-        argTypes.push_back(indexTy);
-      }
-
-      // LDS dst offset from cache.
-      assert(ldsCache.count(dst) && "DMA dst LDS not pre-allocated");
-      callArgs.push_back(ldsCache[dst]);
-      argTypes.push_back(indexTy);
-
-      auto funcTy = builder.getFunctionType(argTypes, {});
-      ensureDecl(builder, declBlock, loc, name, funcTy);
-      func::CallOp::create(builder, loc, name, TypeRange{}, callArgs);
-      toErase.push_back(dma);
-    });
-
-    // Now process linalg ops — they'll hit the ldsCache for shared allocs.
-    moduleOp->walk([&](linalg::FillOp op) {
-      replaceWithCall(builder, declBlock, op, "fill", toErase, ldsCache);
-    });
-    moduleOp->walk([&](linalg::CopyOp op) {
-      replaceWithCall(builder, declBlock, op, "copy", toErase, ldsCache);
-    });
-    moduleOp->walk([&](memref::CopyOp op) {
-      replaceWithCall(builder, declBlock, op, "copy", toErase, ldsCache);
-    });
-    moduleOp->walk([&](linalg::MatmulOp op) {
-      replaceWithCall(builder, declBlock, op, "mfma_matmul", toErase, ldsCache);
-    });
-    moduleOp->walk([&](linalg::GenericOp op) {
-      if (op.getNumDpsInputs() == 2 && op.getNumDpsInits() == 1 &&
-          op.getNumReductionLoops() == 1)
-        replaceWithCall(builder, declBlock, op, "mfma_matmul", toErase,
-                        ldsCache);
-    });
-
-    for (auto *op : toErase)
-      op->erase();
-
-    // Erase linalg.fill on global (non-LDS) buffers.
-    // The library's zero_C handles accumulator init, so the fill is redundant.
-    // It must be erased because the aster backend cannot lower linalg.fill
-    // on global memrefs.
-    SmallVector<linalg::FillOp> globalFills;
-    moduleOp->walk([&](linalg::FillOp fill) {
-      for (Value out : fill.getDpsInits())
-        if (isa<MemRefType>(out.getType()) && !isPromotedBuffer(out))
-          globalFills.push_back(fill);
-    });
-    for (auto fill : globalFills)
-      fill->erase();
-
+    if (failed(applyPatternsGreedily(moduleOp, std::move(patterns))))
+      signalPassFailure();
   }
 };
 
